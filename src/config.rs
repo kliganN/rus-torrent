@@ -20,7 +20,7 @@ impl AppConfig {
 
     pub fn discover_in(data_dir: PathBuf) -> Result<Self> {
         let config = Self {
-            default_download_dir: data_dir.join("downloads"),
+            default_download_dir: default_home_dir()?,
             incoming_torrents_dir: data_dir.join("incoming-torrents"),
             data_dir,
         };
@@ -38,5 +38,12 @@ impl AppConfig {
             format!("failed to create {}", self.incoming_torrents_dir.display())
         })?;
         Ok(())
+    }
+}
+
+fn default_home_dir() -> Result<PathBuf> {
+    match env::var_os("HOME") {
+        Some(home) => Ok(PathBuf::from(home)),
+        None => env::current_dir().context("failed to determine the home directory"),
     }
 }

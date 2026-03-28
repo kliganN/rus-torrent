@@ -33,19 +33,6 @@ pub struct CompletionSet {
     pub candidates: Vec<CompletionCandidate>,
 }
 
-impl CompletionSet {
-    pub fn common_prefix(&self) -> Option<String> {
-        let mut iter = self.candidates.iter();
-        let first = iter.next()?.replacement.clone();
-
-        let prefix = iter.fold(first, |prefix, candidate| {
-            shared_prefix(&prefix, &candidate.replacement)
-        });
-
-        (prefix.len() > self.seed_input.len()).then_some(prefix)
-    }
-}
-
 pub fn collect_candidates(input: &str, mode: PathCompletionMode) -> Result<CompletionSet> {
     let seed_input = input.trim().to_string();
     let lookup = Lookup::from_input(&seed_input)?;
@@ -158,9 +145,19 @@ struct Lookup {
 impl Lookup {
     fn from_input(input: &str) -> Result<Self> {
         if input.is_empty() {
+            let (search_dir, raw_dir_prefix) = match env::var("HOME") {
+                Ok(home) => (PathBuf::from(home), "~/".to_string()),
+                Err(_) => {
+                    let cwd = env::current_dir()
+                        .context("failed to determine current working directory")?;
+                    let prefix = format!("{}/", cwd.display());
+                    (cwd, prefix)
+                }
+            };
+
             return Ok(Self {
-                search_dir: PathBuf::from("/"),
-                raw_dir_prefix: "/".to_string(),
+                search_dir,
+                raw_dir_prefix,
                 entry_prefix: String::new(),
             });
         }
@@ -219,12 +216,4 @@ fn matches_mode(path: &Path, is_dir: bool, is_file: bool, mode: PathCompletionMo
             .is_some_and(|extension| extension.eq_ignore_ascii_case("torrent")),
         PathCompletionMode::Directory => false,
     }
-}
-
-fn shared_prefix(lhs: &str, rhs: &str) -> String {
-    lhs.chars()
-        .zip(rhs.chars())
-        .take_while(|(lhs_char, rhs_char)| lhs_char == rhs_char)
-        .map(|(character, _)| character)
-        .collect()
 }

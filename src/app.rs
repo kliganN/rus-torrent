@@ -14,7 +14,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
     DefaultTerminal, Frame,
 };
-use std::time::Duration;
+use std::{env, path::Path, time::Duration};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
 const MAX_VISIBLE_COMPLETIONS: usize = 8;
@@ -46,10 +46,6 @@ struct CompletionState {
 }
 
 impl CompletionState {
-    fn current_replacement(&self) -> &str {
-        self.candidates[self.selected].replacement.as_str()
-    }
-
     fn step(&mut self, direction: CompletionDirection) {
         self.selected = match direction {
             CompletionDirection::Forward => (self.selected + 1) % self.candidates.len(),
@@ -64,9 +60,7 @@ impl CompletionState {
     }
 
     fn can_continue(&self, field: FormField, current_input: &str) -> bool {
-        self.field == field
-            && !self.candidates.is_empty()
-            && (current_input == self.seed_input || current_input == self.current_replacement())
+        self.field == field && !self.candidates.is_empty() && current_input == self.seed_input
     }
 }
 
@@ -254,34 +248,43 @@ impl App {
             return Ok(());
         }
 
-        match key.code {
-            KeyCode::Left => {
-                self.focus = FocusArea::Menu;
-                return Ok(());
-            }
-            KeyCode::Right => {
-                self.focus = FocusArea::Content;
-                return Ok(());
-            }
-            KeyCode::Esc => {
-                self.focus = FocusArea::Menu;
-                return Ok(());
-            }
-            _ => {}
-        }
-
         match self.focus {
-            FocusArea::Menu => {
-                self.handle_menu_key(key);
-                Ok(())
-            }
-            FocusArea::Content => match self.current_screen() {
-                Screen::AddTorrent => self.handle_add_torrent_key(key).await,
-                Screen::Downloads => {
-                    self.handle_downloads_key(key);
+            FocusArea::Menu => match key.code {
+                KeyCode::Right => {
+                    self.focus = FocusArea::Content;
                     Ok(())
                 }
-                Screen::Server => Ok(()),
+                KeyCode::Esc => Ok(()),
+                _ => {
+                    self.handle_menu_key(key);
+                    Ok(())
+                }
+            },
+            FocusArea::Content => match self.current_screen() {
+                Screen::AddTorrent => match key.code {
+                    KeyCode::Esc => {
+                        self.focus = FocusArea::Menu;
+                        Ok(())
+                    }
+                    _ => self.handle_add_torrent_key(key).await,
+                },
+                Screen::Downloads => match key.code {
+                    KeyCode::Left | KeyCode::Esc => {
+                        self.focus = FocusArea::Menu;
+                        Ok(())
+                    }
+                    _ => {
+                        self.handle_downloads_key(key);
+                        Ok(())
+                    }
+                },
+                Screen::Server => match key.code {
+                    KeyCode::Left | KeyCode::Esc => {
+                        self.focus = FocusArea::Menu;
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                },
             },
         }
     }
@@ -430,10 +433,12 @@ impl App {
 
     async fn handle_add_torrent_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
-            KeyCode::Up => self.form_field = self.form_field.previous(),
-            KeyCode::Down => self.form_field = self.form_field.next(),
-            KeyCode::Tab => self.complete_active_input(CompletionDirection::Forward)?,
-            KeyCode::BackTab => self.complete_active_input(CompletionDirection::Backward)?,
+            KeyCode::Up => self.move_browser_selection(CompletionDirection::Backward)?,
+            KeyCode::Down => self.move_browser_selection(CompletionDirection::Forward)?,
+            KeyCode::Left => self.browse_parent_directory()?,
+            KeyCode::Right => self.activate_browser_selection()?,
+            KeyCode::Tab => self.switch_active_form_field(self.form_field.next()),
+            KeyCode::BackTab => self.switch_active_form_field(self.form_field.previous()),
             KeyCode::Backspace => self.pop_active_input(),
             KeyCode::Delete => self.clear_active_input(),
             KeyCode::Enter => self.submit_torrent().await?,
@@ -448,6 +453,12 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn switch_active_form_field(&mut self, field: FormField) {
+        self.clear_completion();
+        self.form_field = field;
+        self.status_line = format!("Active field: {}", self.form_field.title());
     }
 
     fn handle_downloads_key(&mut self, key: KeyEvent) {
@@ -499,69 +510,116 @@ impl App {
         Ok(())
     }
 
-    fn complete_active_input(&mut self, direction: CompletionDirection) -> Result<()> {
+    fn move_browser_selection(&mut self, direction: CompletionDirection) -> Result<()> {
         let field = self.form_field;
         let current_input = self.active_value(field).trim().to_string();
 
         if !field.supports_local_completion(&current_input) {
             self.clear_completion();
             self.status_line =
-                "Local path completion is disabled for HTTP/HTTPS and magnet sources".to_string();
+                "Path browser is unavailable for HTTP/HTTPS and magnet sources".to_string();
             return Ok(());
         }
 
-        if let Some(state) = &mut self.completion_state {
-            if state.can_continue(field, &current_input) {
-                state.step(direction);
-                let replacement = state.current_replacement().to_string();
-                let total = state.candidates.len();
-                let index = state.selected + 1;
-                self.set_active_value(field, replacement);
-                self.status_line =
-                    format!("{} completion {index}/{total}", field.completion_subject());
-                return Ok(());
+        let has_existing_state = self
+            .completion_state
+            .as_ref()
+            .is_some_and(|state| state.can_continue(field, &current_input));
+
+        let Some(mut state) = self.load_browser_state(field, &current_input)? else {
+            self.clear_completion();
+            self.status_line = format!("No {} entries found", field.browser_subject());
+            return Ok(());
+        };
+
+        if has_existing_state {
+            state.step(direction);
+        } else {
+            state.selected = match direction {
+                CompletionDirection::Forward => 0,
+                CompletionDirection::Backward => state.candidates.len() - 1,
+            };
+        }
+        let total = state.candidates.len();
+        let index = state.selected + 1;
+        self.completion_state = Some(state);
+        self.status_line = format!("{} browser {index}/{total}", field.browser_subject(),);
+
+        Ok(())
+    }
+
+    fn activate_browser_selection(&mut self) -> Result<()> {
+        let field = self.form_field;
+        let current_input = self.active_value(field).trim().to_string();
+
+        if !field.supports_local_completion(&current_input) {
+            self.clear_completion();
+            self.status_line =
+                "Path browser is unavailable for HTTP/HTTPS and magnet sources".to_string();
+            return Ok(());
+        }
+
+        let Some(state) = self.load_browser_state(field, &current_input)? else {
+            self.clear_completion();
+            self.status_line = format!("No {} entries found", field.browser_subject());
+            return Ok(());
+        };
+
+        let selected = &state.candidates[state.selected];
+        let replacement = selected.replacement.clone();
+        let is_dir = selected.is_dir;
+
+        self.set_active_value(field, replacement.clone());
+        self.clear_completion();
+        self.status_line = if is_dir {
+            format!("Opened {}", replacement)
+        } else {
+            format!("Selected torrent file: {}", replacement)
+        };
+
+        Ok(())
+    }
+
+    fn browse_parent_directory(&mut self) -> Result<()> {
+        let field = self.form_field;
+        let current_input = self.active_value(field).trim();
+
+        if !field.supports_local_completion(current_input) {
+            self.clear_completion();
+            self.status_line =
+                "Path browser is unavailable for HTTP/HTTPS and magnet sources".to_string();
+            return Ok(());
+        }
+
+        let parent = parent_input_path(current_input)?;
+        self.set_active_value(field, parent.clone());
+        self.clear_completion();
+        self.status_line = format!("Moved to parent: {parent}");
+        Ok(())
+    }
+
+    fn load_browser_state(
+        &self,
+        field: FormField,
+        current_input: &str,
+    ) -> Result<Option<CompletionState>> {
+        if let Some(state) = &self.completion_state {
+            if state.can_continue(field, current_input) {
+                return Ok(Some(state.clone()));
             }
         }
 
         let completion_set = collect_candidates(self.active_value(field), field.completion_mode())?;
-
         if completion_set.candidates.is_empty() {
-            self.clear_completion();
-            self.status_line = format!("No {} matches found", field.completion_subject());
-            return Ok(());
+            return Ok(None);
         }
 
-        if completion_set.candidates.len() > 1 {
-            if let Some(prefix) = completion_set.common_prefix() {
-                self.clear_completion();
-                self.set_active_value(field, prefix.clone());
-                self.status_line = format!("Expanded to common prefix: {prefix}");
-                return Ok(());
-            }
-        }
-
-        let selected = match direction {
-            CompletionDirection::Forward => 0,
-            CompletionDirection::Backward => completion_set.candidates.len() - 1,
-        };
-        let replacement = completion_set.candidates[selected].replacement.clone();
-        let total = completion_set.candidates.len();
-
-        self.set_active_value(field, replacement);
-        self.completion_state = Some(CompletionState {
+        Ok(Some(CompletionState {
             field,
             seed_input: completion_set.seed_input,
             candidates: completion_set.candidates,
-            selected,
-        });
-        self.status_line = format!(
-            "{} completion {}/{}",
-            field.completion_subject(),
-            selected + 1,
-            total
-        );
-
-        Ok(())
+            selected: 0,
+        }))
     }
 
     fn refresh_downloads(&mut self) {
@@ -891,7 +949,8 @@ impl App {
             _ => {
                 let completion =
                     collect_candidates(self.active_value(field), field.completion_mode())?;
-                (completion.candidates, None)
+                let selected = (!completion.candidates.is_empty()).then_some(0);
+                (completion.candidates, selected)
             }
         };
 
@@ -917,23 +976,18 @@ impl App {
             return Text::from(vec![
                 Line::from("This field currently contains a URL or magnet link."),
                 Line::from("Press Enter to start downloading it immediately."),
-                Line::from("Local path completion is only available for filesystem paths."),
+                Line::from("The path browser is only available for filesystem paths."),
             ]);
         }
 
         match self.form_field {
             FormField::TorrentSource => Text::from(vec![
-                Line::from("This field accepts three source types:"),
-                Line::from("1. Local .torrent files"),
-                Line::from("2. HTTP/HTTPS URLs to .torrent files"),
-                Line::from("3. magnet: links"),
-                Line::from(""),
-                Line::from("For local files, press Tab to autocomplete from /."),
+                Line::from("No local torrent files or folders match the current input."),
+                Line::from("Start typing a path or move to another directory."),
             ]),
             FormField::DownloadDir => Text::from(vec![
-                Line::from("Type a path and press Tab to autocomplete."),
-                Line::from("An empty field starts browsing from /."),
-                Line::from("Only directories are listed here."),
+                Line::from("No directories match the current input."),
+                Line::from("Start typing a path or move to another directory."),
             ]),
         }
     }
@@ -944,7 +998,7 @@ impl App {
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(0),
-                Constraint::Length(5),
+                Constraint::Length(3),
             ])
             .split(frame.area());
 
@@ -1065,11 +1119,11 @@ impl App {
 
         let bottom = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
             .split(chunks[2]);
 
         self.render_completion_panel(frame, bottom[0]);
-        self.render_add_help(frame, bottom[1]);
+        self.render_add_summary(frame, bottom[1]);
     }
 
     fn render_completion_panel(&self, frame: &mut Frame, area: Rect) {
@@ -1080,7 +1134,7 @@ impl App {
                     .wrap(Wrap { trim: true })
                     .block(
                         Block::default()
-                            .title(format!("{} Completion", self.form_field.short_title()))
+                            .title(format!("{} Browser", self.form_field.short_title()))
                             .borders(Borders::ALL),
                     );
                 frame.render_widget(empty, area);
@@ -1110,7 +1164,7 @@ impl App {
 
                 let title = if preview.total_matches > preview.candidates.len() {
                     format!(
-                        "{} Completion (showing {}-{} of {})",
+                        "{} Browser (showing {}-{} of {})",
                         self.form_field.short_title(),
                         preview.start_index + 1,
                         preview.start_index + preview.candidates.len(),
@@ -1118,7 +1172,7 @@ impl App {
                     )
                 } else {
                     format!(
-                        "{} Completion ({})",
+                        "{} Browser ({})",
                         self.form_field.short_title(),
                         preview.total_matches
                     )
@@ -1138,51 +1192,53 @@ impl App {
             }
             Err(error) => {
                 let message = Paragraph::new(Text::from(vec![
-                    Line::from("Autocomplete is currently unavailable."),
+                    Line::from("Path browser is currently unavailable."),
                     Line::from(format!("{error:#}")),
                 ]))
                 .wrap(Wrap { trim: true })
-                .block(
-                    Block::default()
-                        .title("Path Completion")
-                        .borders(Borders::ALL),
-                );
+                .block(Block::default().title("Path Browser").borders(Borders::ALL));
                 frame.render_widget(message, area);
             }
         }
     }
 
-    fn render_add_help(&self, frame: &mut Frame, area: Rect) {
+    fn render_add_summary(&self, frame: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(9), Constraint::Min(0)])
+            .constraints([Constraint::Length(11), Constraint::Min(0)])
             .split(area);
 
-        let controls = Paragraph::new(Text::from(vec![
+        let source_summary = describe_torrent_source(&self.torrent_source);
+        let output_summary = describe_output_directory(&self.download_dir);
+
+        let selection = Paragraph::new(Text::from(vec![
             Line::from(format!("Active field: {}", self.form_field.title())),
-            Line::from("Tab: next completion match for local paths"),
-            Line::from("Shift+Tab: previous completion match"),
-            Line::from("Up/Down: switch field"),
-            Line::from("Empty field + Tab: browse from /"),
-            Line::from("Paste: local path, HTTP/HTTPS .torrent URL, or magnet link"),
-            Line::from("Enter: add torrent"),
-            Line::from("F1: open help popup"),
-            Line::from("Esc: return to menu"),
+            Line::from(""),
+            Line::from(format!("Source: {}", source_summary.kind)),
+            Line::from(source_summary.value),
+            Line::from(""),
+            Line::from("Output directory:"),
+            Line::from(output_summary),
         ]))
         .wrap(Wrap { trim: true })
-        .block(Block::default().title("Controls").borders(Borders::ALL));
+        .block(Block::default().title("Selection").borders(Borders::ALL));
 
-        frame.render_widget(controls, chunks[0]);
+        frame.render_widget(selection, chunks[0]);
 
         let future = Paragraph::new(Text::from(vec![
+            Line::from(format!("Data dir: {}", self.config.data_dir.display())),
             Line::from(format!(
-                "Incoming .torrent folder: {}",
+                "Incoming .torrent dir: {}",
                 self.config.incoming_torrents_dir.display()
             )),
-            Line::from("This directory is reserved for future Telegram bot uploads."),
+            Line::from(""),
+            Line::from(format!(
+                "Default downloads: {}",
+                self.config.default_download_dir.display()
+            )),
         ]))
         .wrap(Wrap { trim: true })
-        .block(Block::default().title("Server Prep").borders(Borders::ALL));
+        .block(Block::default().title("Workspace").borders(Borders::ALL));
 
         frame.render_widget(future, chunks[1]);
     }
@@ -1390,8 +1446,7 @@ impl App {
         let text = if self.total_downloads == 0 {
             Text::from(vec![
                 Line::from("No torrents have been added yet."),
-                Line::from("Open 'Choose torrent source' and queue a source."),
-                Line::from("F1 opens the full hotkey reference."),
+                Line::from("Queue a source from the add screen to start the session."),
             ])
         } else {
             Text::from(vec![
@@ -1400,7 +1455,7 @@ impl App {
                     "Current filter: {}",
                     self.downloads_view.filter_summary()
                 )),
-                Line::from("Press / to edit the filter, or c to clear it."),
+                Line::from("Adjust the filter to show hidden downloads."),
             ])
         };
 
@@ -1439,14 +1494,9 @@ impl App {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let help = self.footer_help_text();
-
-        let footer = Paragraph::new(Text::from(vec![
-            Line::from(self.status_line.as_str()),
-            Line::from(help),
-        ]))
-        .wrap(Wrap { trim: true })
-        .block(Block::default().title("Status").borders(Borders::ALL));
+        let footer = Paragraph::new(Line::from(self.status_line.as_str()))
+            .wrap(Wrap { trim: true })
+            .block(Block::default().title("Status").borders(Borders::ALL));
 
         frame.render_widget(footer, area);
     }
@@ -1480,13 +1530,15 @@ impl App {
             Line::from("Ctrl+C or F10: force exit immediately"),
             Line::from(""),
             Line::styled(
-                "Choose Torrent Source",
+                "Source URL/file",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Line::from("Up/Down: switch active field"),
-            Line::from("Tab / Shift+Tab: cycle local path completion"),
+            Line::from("Tab / Shift+Tab: switch active field"),
+            Line::from("Up/Down: move browser selection"),
+            Line::from("Left: parent directory"),
+            Line::from("Right: open highlighted entry"),
             Line::from("Paste: insert file path, URL, or magnet link"),
             Line::from("Enter: queue the torrent"),
             Line::from(""),
@@ -1563,9 +1615,6 @@ impl App {
         let help = Paragraph::new(Text::from(vec![
             Line::from("Filtering is case-insensitive."),
             Line::from("Separate multiple terms with spaces; every term must match."),
-            Line::from("Enter: apply filter"),
-            Line::from("Esc: cancel"),
-            Line::from("Ctrl+U or Delete: clear the input"),
         ]))
         .wrap(Wrap { trim: true })
         .block(
@@ -1590,11 +1639,7 @@ impl App {
         let inner = inner_rect(area);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(5),
-            ])
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
             .split(inner);
 
         let order = Paragraph::new(Line::from(vec![
@@ -1639,16 +1684,6 @@ impl App {
             )
             .highlight_symbol(">> ");
         frame.render_stateful_widget(list, chunks[1], &mut list_state);
-
-        let help = Paragraph::new(Text::from(vec![
-            Line::from("Up/Down or j/k: choose a sort field"),
-            Line::from("Left/Right or r: toggle ascending / descending"),
-            Line::from("Enter: apply"),
-            Line::from("Esc: cancel"),
-        ]))
-        .wrap(Wrap { trim: true })
-        .block(Block::default().title("Controls").borders(Borders::ALL));
-        frame.render_widget(help, chunks[2]);
     }
 
     fn render_confirm_popup(&self, frame: &mut Frame, confirm: &ConfirmState) {
@@ -1698,11 +1733,6 @@ impl App {
                 format!(" {} ", confirm.action.confirm_label()),
                 confirm_style,
             ),
-            Span::raw("  "),
-            Span::styled("Enter", Style::default().fg(Color::Cyan)),
-            Span::raw(" apply  "),
-            Span::styled("Esc", Style::default().fg(Color::Cyan)),
-            Span::raw(" cancel"),
         ]))
         .wrap(Wrap { trim: true })
         .block(Block::default().title("Choice").borders(Borders::ALL));
@@ -1759,33 +1789,6 @@ impl App {
         }
     }
 
-    fn footer_help_text(&self) -> &'static str {
-        if let Some(modal) = &self.modal {
-            return match modal {
-                ModalState::Help => "F1/Esc/Enter close help | Ctrl+C/F10 force exit",
-                ModalState::FilterInput { .. } => {
-                    "Type terms | Enter apply filter | Ctrl+U/Delete clear | Esc cancel"
-                }
-                ModalState::SortPicker { .. } => {
-                    "Up/Down choose field | Left/Right toggle order | Enter apply | Esc cancel"
-                }
-                ModalState::Confirm(_) => {
-                    "Left/Right or Tab choose | Enter confirm | y/n quick answer | Esc cancel"
-                }
-            };
-        }
-
-        match self.current_screen() {
-            Screen::AddTorrent => {
-                "F1 help | Tab local completion | Up/Down switch field | Enter add torrent | Esc menu"
-            }
-            Screen::Downloads => {
-                "F1 help | / filter | s sort | r reverse | m mode | c clear | x reset | q quit"
-            }
-            Screen::Server => "F1 help | Left/Right focus | Esc menu | q quit",
-        }
-    }
-
     fn active_modal_title(&self) -> Option<&'static str> {
         match &self.modal {
             Some(ModalState::Help) => Some("help"),
@@ -1831,7 +1834,7 @@ impl FormField {
 
     fn title(self) -> &'static str {
         match self {
-            Self::TorrentSource => "Torrent source",
+            Self::TorrentSource => "Source URL/file",
             Self::DownloadDir => "Output directory",
         }
     }
@@ -1848,11 +1851,11 @@ impl FormField {
             Self::TorrentSource => {
                 "Example: ./movie.torrent, https://site/file.torrent, or magnet:?..."
             }
-            Self::DownloadDir => "Example: ~/downloads",
+            Self::DownloadDir => "Example: /home/user/",
         }
     }
 
-    fn completion_subject(self) -> &'static str {
+    fn browser_subject(self) -> &'static str {
         match self {
             Self::TorrentSource => "source path",
             Self::DownloadDir => "directory path",
@@ -1893,7 +1896,7 @@ impl Screen {
 
     fn title(self) -> &'static str {
         match self {
-            Self::AddTorrent => "Choose torrent source",
+            Self::AddTorrent => "Source URL/file",
             Self::Downloads => "Downloads",
             Self::Server => "Server",
         }
@@ -1997,6 +2000,109 @@ impl ConfirmChoice {
             Self::Cancel => Self::Confirm,
         };
     }
+}
+
+struct SourceSummary {
+    kind: &'static str,
+    value: String,
+}
+
+fn describe_torrent_source(input: &str) -> SourceSummary {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return SourceSummary {
+            kind: "not set",
+            value: "Waiting for a local file, remote URL, or magnet link.".to_string(),
+        };
+    }
+
+    match TorrentSource::parse(trimmed) {
+        Ok(TorrentSource::LocalFile(path)) => {
+            let kind = if path.is_file() {
+                "local file"
+            } else if path.is_dir() {
+                "directory"
+            } else {
+                "local path"
+            };
+
+            SourceSummary {
+                kind,
+                value: format_input_path(&path, path.is_dir()),
+            }
+        }
+        Ok(TorrentSource::RemoteUrl(url)) => SourceSummary {
+            kind: "remote URL",
+            value: url,
+        },
+        Ok(TorrentSource::Magnet(link)) => SourceSummary {
+            kind: "magnet link",
+            value: link,
+        },
+        Err(error) => SourceSummary {
+            kind: "invalid",
+            value: format!("{error:#}"),
+        },
+    }
+}
+
+fn describe_output_directory(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return "Waiting for a directory path.".to_string();
+    }
+
+    match resolve_user_path(trimmed) {
+        Ok(path) => format_input_path(&path, true),
+        Err(error) => format!("{error:#}"),
+    }
+}
+
+fn default_browser_root() -> Result<String> {
+    match env::var("HOME") {
+        Ok(_) => Ok("~/".to_string()),
+        Err(_) => {
+            let cwd =
+                env::current_dir().context("failed to determine current working directory")?;
+            Ok(format!("{}/", cwd.display()))
+        }
+    }
+}
+
+fn parent_input_path(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return default_browser_root();
+    }
+
+    let resolved = resolve_user_path(trimmed)?;
+    let base = if trimmed.ends_with('/') {
+        resolved
+    } else {
+        resolved.parent().map(Path::to_path_buf).unwrap_or(resolved)
+    };
+
+    let parent = base.parent().unwrap_or(base.as_path());
+    Ok(format_input_path(parent, true))
+}
+
+fn format_input_path(path: &Path, is_dir: bool) -> String {
+    let home = env::var("HOME").ok().map(std::path::PathBuf::from);
+
+    let mut rendered = match home
+        .as_ref()
+        .and_then(|home_dir| path.strip_prefix(home_dir).ok())
+    {
+        Some(relative) if relative.as_os_str().is_empty() => "~".to_string(),
+        Some(relative) => format!("~/{}", relative.display()),
+        None => path.display().to_string(),
+    };
+
+    if is_dir && !rendered.ends_with('/') {
+        rendered.push('/');
+    }
+
+    rendered
 }
 
 fn completion_window(total_items: usize, selected: Option<usize>) -> (usize, usize) {
