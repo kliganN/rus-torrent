@@ -14,7 +14,13 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
     DefaultTerminal, Frame,
 };
-use std::{env, path::Path, time::Duration};
+use std::{
+    collections::HashSet,
+    env,
+    path::Path,
+    sync::mpsc::{self, Receiver, Sender},
+    time::Duration,
+};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
 const MAX_VISIBLE_COMPLETIONS: usize = 8;
@@ -32,9 +38,22 @@ pub struct App {
     download_dir: String,
     completion_state: Option<CompletionState>,
     downloads_view: DownloadsView,
+    download_action: DownloadAction,
+    pending_cancellations: HashSet<usize>,
+    event_tx: Sender<AppEvent>,
+    event_rx: Receiver<AppEvent>,
     modal: Option<ModalState>,
     status_line: String,
     should_quit: bool,
+}
+
+#[derive(Debug)]
+enum AppEvent {
+    CancelCompleted {
+        id: usize,
+        name: String,
+        result: std::result::Result<(), String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -176,10 +195,19 @@ enum ConfirmChoice {
     Cancel,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DownloadAction {
+    #[default]
+    Stop,
+    Resume,
+    Cancel,
+}
+
 impl App {
     pub fn new(config: AppConfig, engine: TorrentEngine) -> Self {
         let mut menu_state = ListState::default();
         menu_state.select(Some(Screen::AddTorrent.index()));
+        let (event_tx, event_rx) = mpsc::channel();
 
         Self {
             download_dir: config.default_download_dir.display().to_string(),
@@ -198,6 +226,10 @@ impl App {
             torrent_source: String::new(),
             completion_state: None,
             downloads_view: DownloadsView::default(),
+            download_action: DownloadAction::default(),
+            pending_cancellations: HashSet::new(),
+            event_tx,
+            event_rx,
             modal: None,
             should_quit: false,
         }
@@ -205,6 +237,7 @@ impl App {
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
         while !self.should_quit {
+            self.handle_app_events();
             self.refresh_downloads();
             terminal.draw(|frame| self.render(frame))?;
 
@@ -223,6 +256,23 @@ impl App {
         Ok(())
     }
 
+    fn handle_app_events(&mut self) {
+        while let Ok(AppEvent::CancelCompleted { id, name, result }) = self.event_rx.try_recv() {
+            self.pending_cancellations.remove(&id);
+            self.focus = FocusArea::Content;
+            self.modal = None;
+
+            match result {
+                Ok(()) => {
+                    self.status_line = format!("Cancelled torrent #{id}: {name}");
+                }
+                Err(error) => {
+                    self.status_line = format!("Failed to cancel torrent #{id}: {error}");
+                }
+            }
+        }
+    }
+
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         if matches!(key.code, KeyCode::F(10))
             || (key.modifiers.contains(KeyModifiers::CONTROL)
@@ -233,7 +283,7 @@ impl App {
         }
 
         if self.modal.is_some() {
-            return self.handle_modal_key(key);
+            return self.handle_modal_key(key).await;
         }
 
         if matches!(key.code, KeyCode::F(1)) {
@@ -269,14 +319,11 @@ impl App {
                     _ => self.handle_add_torrent_key(key).await,
                 },
                 Screen::Downloads => match key.code {
-                    KeyCode::Left | KeyCode::Esc => {
+                    KeyCode::Esc => {
                         self.focus = FocusArea::Menu;
                         Ok(())
                     }
-                    _ => {
-                        self.handle_downloads_key(key);
-                        Ok(())
-                    }
+                    _ => self.handle_downloads_key(key).await,
                 },
                 Screen::Server => match key.code {
                     KeyCode::Left | KeyCode::Esc => {
@@ -289,7 +336,7 @@ impl App {
         }
     }
 
-    fn handle_modal_key(&mut self, key: KeyEvent) -> Result<()> {
+    async fn handle_modal_key(&mut self, key: KeyEvent) -> Result<()> {
         let Some(modal) = self.modal.take() else {
             return Ok(());
         };
@@ -404,12 +451,12 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if confirm.selected == ConfirmChoice::Confirm {
-                        self.apply_confirm_action(confirm.action);
+                        self.apply_confirm_action(confirm.action).await;
                     } else {
                         self.status_line = format!("{} cancelled", confirm.action.title());
                     }
                 }
-                KeyCode::Char('y') => self.apply_confirm_action(confirm.action),
+                KeyCode::Char('y') => self.apply_confirm_action(confirm.action).await,
                 KeyCode::Char('n') => {
                     self.status_line = format!("{} cancelled", confirm.action.title());
                 }
@@ -461,12 +508,23 @@ impl App {
         self.status_line = format!("Active field: {}", self.form_field.title());
     }
 
-    fn handle_downloads_key(&mut self, key: KeyEvent) {
+    async fn handle_downloads_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_download(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_download(),
             KeyCode::Home | KeyCode::Char('g') => self.select_first_download(),
             KeyCode::End | KeyCode::Char('G') => self.select_last_download(),
+            KeyCode::Left | KeyCode::Char('h') => {
+                if let Some(download) = self.selected_download() {
+                    self.download_action = self.download_action.previous_available(download);
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if let Some(download) = self.selected_download() {
+                    self.download_action = self.download_action.next_available(download);
+                }
+            }
+            KeyCode::Enter => self.execute_selected_download_action().await?,
             KeyCode::Char('/') => self.open_filter_dialog(),
             KeyCode::Char('s') => self.open_sort_dialog(),
             KeyCode::Char('r') => self.reverse_sort_direction(),
@@ -475,6 +533,9 @@ impl App {
             KeyCode::Char('x') => self.open_confirm(ConfirmAction::ResetDownloadsView),
             _ => {}
         }
+
+        self.normalize_download_action();
+        Ok(())
     }
 
     async fn submit_torrent(&mut self) -> Result<()> {
@@ -640,6 +701,7 @@ impl App {
             .and_then(|id| self.downloads.iter().position(|download| download.id == id))
             .unwrap_or(0);
         self.downloads_state.select(Some(selected));
+        self.normalize_download_action();
     }
 
     fn push_active_input(&mut self, character: char) {
@@ -751,6 +813,22 @@ impl App {
             .map(|download| download.id)
     }
 
+    fn selected_download(&self) -> Option<&TorrentSnapshot> {
+        self.downloads_state
+            .selected()
+            .and_then(|index| self.downloads.get(index))
+    }
+
+    fn normalize_download_action(&mut self) {
+        if let Some(download) = self.selected_download() {
+            if self.pending_cancellations.contains(&download.id)
+                || !self.download_action.is_available(download)
+            {
+                self.download_action = DownloadAction::preferred_for(download);
+            }
+        }
+    }
+
     fn select_previous_download(&mut self) {
         if self.downloads.is_empty() {
             return;
@@ -758,6 +836,7 @@ impl App {
 
         let current = self.downloads_state.selected().unwrap_or(0);
         self.downloads_state.select(Some(current.saturating_sub(1)));
+        self.normalize_download_action();
     }
 
     fn select_next_download(&mut self) {
@@ -768,6 +847,7 @@ impl App {
         let current = self.downloads_state.selected().unwrap_or(0);
         let next = (current + 1).min(self.downloads.len() - 1);
         self.downloads_state.select(Some(next));
+        self.normalize_download_action();
     }
 
     fn select_first_download(&mut self) {
@@ -776,6 +856,7 @@ impl App {
         }
 
         self.downloads_state.select(Some(0));
+        self.normalize_download_action();
     }
 
     fn select_last_download(&mut self) {
@@ -784,6 +865,80 @@ impl App {
         }
 
         self.downloads_state.select(Some(self.downloads.len() - 1));
+        self.normalize_download_action();
+    }
+
+    async fn execute_selected_download_action(&mut self) -> Result<()> {
+        let Some(download) = self.selected_download().cloned() else {
+            self.status_line = "No torrent selected".to_string();
+            return Ok(());
+        };
+
+        if self.pending_cancellations.contains(&download.id) {
+            self.status_line = format!(
+                "Cancellation is already in progress for torrent #{}: {}",
+                download.id, download.name
+            );
+            return Ok(());
+        }
+
+        if !self.download_action.is_available(&download) {
+            self.status_line = format!(
+                "{} is unavailable for {}",
+                self.download_action.title(),
+                download.name
+            );
+            return Ok(());
+        }
+
+        match self.download_action {
+            DownloadAction::Stop => match self.engine.stop_download(download.id).await {
+                Ok(()) => {
+                    self.status_line =
+                        format!("Stopped torrent #{}: {}", download.id, download.name);
+                    self.refresh_downloads();
+                    self.normalize_download_action();
+                    self.focus = FocusArea::Content;
+                }
+                Err(error) => {
+                    self.status_line =
+                        format!("Failed to stop torrent #{}: {error:#}", download.id);
+                }
+            },
+            DownloadAction::Resume => match self.engine.resume_download(download.id).await {
+                Ok(()) => {
+                    self.status_line =
+                        format!("Resumed torrent #{}: {}", download.id, download.name);
+                    self.refresh_downloads();
+                    self.normalize_download_action();
+                    self.focus = FocusArea::Content;
+                }
+                Err(error) => {
+                    self.status_line =
+                        format!("Failed to resume torrent #{}: {error:#}", download.id);
+                }
+            },
+            DownloadAction::Cancel => {
+                let id = download.id;
+                let name = download.name;
+                let engine = self.engine.clone();
+                let tx = self.event_tx.clone();
+
+                self.pending_cancellations.insert(id);
+                self.focus = FocusArea::Content;
+                self.status_line = format!("Cancelling torrent #{id}: {name}");
+
+                tokio::spawn(async move {
+                    let result = engine
+                        .cancel_download(id)
+                        .await
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = tx.send(AppEvent::CancelCompleted { id, name, result });
+                });
+            }
+        }
+
+        Ok(())
     }
 
     fn open_help_popup(&mut self) {
@@ -845,7 +1000,7 @@ impl App {
         self.open_confirm(ConfirmAction::ClearFilter);
     }
 
-    fn apply_confirm_action(&mut self, action: ConfirmAction) {
+    async fn apply_confirm_action(&mut self, action: ConfirmAction) {
         match action {
             ConfirmAction::ExitApp => {
                 self.status_line = "Closing rus-torrent".to_string();
@@ -1336,6 +1491,7 @@ impl App {
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3),
+                    Constraint::Length(3),
                     Constraint::Length(13),
                     Constraint::Min(0),
                 ])
@@ -1358,6 +1514,8 @@ impl App {
                 .label(label);
 
             frame.render_widget(gauge, right[0]);
+
+            self.render_download_actions(frame, right[1], download);
 
             let stats = Paragraph::new(Text::from(vec![
                 Line::from(format!("State: {}", download.state)),
@@ -1401,7 +1559,7 @@ impl App {
             .wrap(Wrap { trim: true })
             .block(Block::default().title("Stats").borders(Borders::ALL));
 
-            frame.render_widget(stats, right[1]);
+            frame.render_widget(stats, right[2]);
 
             let details = Paragraph::new(Text::from(vec![
                 Line::from(format!("Source: {}", download.source)),
@@ -1410,8 +1568,40 @@ impl App {
             .wrap(Wrap { trim: true })
             .block(Block::default().title("Paths").borders(Borders::ALL));
 
-            frame.render_widget(details, right[2]);
+            frame.render_widget(details, right[3]);
         }
+    }
+
+    fn render_download_actions(&self, frame: &mut Frame, area: Rect, download: &TorrentSnapshot) {
+        let cancel_pending = self.pending_cancellations.contains(&download.id);
+        let spans = DownloadAction::all()
+            .iter()
+            .flat_map(|action| {
+                let title = if cancel_pending && *action == DownloadAction::Cancel {
+                    " Cancelling... ".to_string()
+                } else {
+                    format!(" {} ", action.title())
+                };
+
+                [
+                    Span::styled(
+                        title,
+                        action.button_style(
+                            self.download_action == *action,
+                            download,
+                            cancel_pending,
+                        ),
+                    ),
+                    Span::raw(" "),
+                ]
+            })
+            .collect::<Vec<_>>();
+
+        let buttons = Paragraph::new(Line::from(spans))
+            .wrap(Wrap { trim: true })
+            .block(Block::default().title("Actions").borders(Borders::ALL));
+
+        frame.render_widget(buttons, area);
     }
 
     fn render_downloads_toolbar(&self, frame: &mut Frame, area: Rect) {
@@ -1549,7 +1739,9 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ),
             Line::from("Up/Down or j/k: select a torrent"),
+            Line::from("Left/Right or h/l: choose Stop / Resume / Cancel"),
             Line::from("Home/End or g/G: jump to first or last torrent"),
+            Line::from("Enter: run the selected action"),
             Line::from("/: open search/filter dialog"),
             Line::from("s: open sort dialog"),
             Line::from("r: reverse current sort order"),
@@ -1967,6 +2159,127 @@ impl DownloadDisplayMode {
     }
 }
 
+impl DownloadAction {
+    fn all() -> [Self; 3] {
+        [Self::Stop, Self::Resume, Self::Cancel]
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Stop => Self::Resume,
+            Self::Resume => Self::Cancel,
+            Self::Cancel => Self::Stop,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Stop => Self::Cancel,
+            Self::Resume => Self::Stop,
+            Self::Cancel => Self::Resume,
+        }
+    }
+
+    fn next_available(self, download: &TorrentSnapshot) -> Self {
+        let mut action = self;
+
+        for _ in 0..Self::all().len() {
+            action = action.next();
+            if action.is_available(download) {
+                return action;
+            }
+        }
+
+        self
+    }
+
+    fn previous_available(self, download: &TorrentSnapshot) -> Self {
+        let mut action = self;
+
+        for _ in 0..Self::all().len() {
+            action = action.previous();
+            if action.is_available(download) {
+                return action;
+            }
+        }
+
+        self
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Stop => "Stop",
+            Self::Resume => "Resume",
+            Self::Cancel => "Cancel",
+        }
+    }
+
+    fn preferred_for(download: &TorrentSnapshot) -> Self {
+        if download.finished {
+            Self::Cancel
+        } else if download.is_stopped() {
+            Self::Resume
+        } else {
+            Self::Stop
+        }
+    }
+
+    fn is_available(self, download: &TorrentSnapshot) -> bool {
+        match self {
+            Self::Stop => !download.finished && !download.is_stopped(),
+            Self::Resume => !download.finished && download.is_stopped(),
+            Self::Cancel => true,
+        }
+    }
+
+    fn button_style(
+        self,
+        selected: bool,
+        download: &TorrentSnapshot,
+        cancel_pending: bool,
+    ) -> Style {
+        if cancel_pending {
+            if self == Self::Cancel {
+                return Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD);
+            }
+
+            return Style::default().fg(Color::DarkGray);
+        }
+
+        if !self.is_available(download) {
+            return Style::default().fg(Color::DarkGray);
+        }
+
+        let base = match self {
+            Self::Stop => Style::default().fg(Color::Yellow),
+            Self::Resume => Style::default().fg(Color::Green),
+            Self::Cancel => Style::default().fg(Color::Red),
+        };
+
+        if selected {
+            match self {
+                Self::Stop => Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+                Self::Resume => Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+                Self::Cancel => Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            }
+        } else {
+            base
+        }
+    }
+}
+
 impl ConfirmAction {
     fn title(self) -> &'static str {
         match self {
@@ -1999,6 +2312,12 @@ impl ConfirmChoice {
             Self::Confirm => Self::Cancel,
             Self::Cancel => Self::Confirm,
         };
+    }
+}
+
+impl TorrentSnapshot {
+    fn is_stopped(&self) -> bool {
+        self.state.to_ascii_lowercase().contains("paused")
     }
 }
 

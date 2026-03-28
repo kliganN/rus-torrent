@@ -1,6 +1,6 @@
 use crate::path_completion::resolve_user_path;
 use anyhow::{anyhow, Context, Result};
-use librqbit::{AddTorrent, AddTorrentOptions, Session};
+use librqbit::{api::TorrentIdOrHash, AddTorrent, AddTorrentOptions, Session};
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -262,6 +262,44 @@ impl TorrentEngine {
 
         downloads.sort_by_key(|download| download.id);
         downloads
+    }
+
+    pub async fn stop_download(&self, id: usize) -> Result<()> {
+        let handle = self
+            .session
+            .get(TorrentIdOrHash::Id(id))
+            .ok_or_else(|| anyhow!("torrent #{id} does not exist"))?;
+
+        self.session
+            .pause(&handle)
+            .await
+            .with_context(|| format!("failed to stop torrent #{id}"))?;
+
+        Ok(())
+    }
+
+    pub async fn resume_download(&self, id: usize) -> Result<()> {
+        let handle = self
+            .session
+            .get(TorrentIdOrHash::Id(id))
+            .ok_or_else(|| anyhow!("torrent #{id} does not exist"))?;
+
+        self.session
+            .unpause(&handle)
+            .await
+            .with_context(|| format!("failed to resume torrent #{id}"))?;
+
+        Ok(())
+    }
+
+    pub async fn cancel_download(&self, id: usize) -> Result<()> {
+        self.session
+            .delete(TorrentIdOrHash::Id(id), true)
+            .await
+            .with_context(|| format!("failed to cancel torrent #{id}"))?;
+
+        self.registrations().remove(&id);
+        Ok(())
     }
 
     fn registrations(&self) -> std::sync::MutexGuard<'_, HashMap<usize, TorrentRegistration>> {
