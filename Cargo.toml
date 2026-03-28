@@ -1,0 +1,11 @@
+[package]
+name = "rus-torrent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.102"
+crossterm = "0.29.0"
+librqbit = "8.1.1"
+ratatui = "0.30.0"
+tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread"] }
