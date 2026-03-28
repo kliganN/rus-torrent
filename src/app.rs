@@ -1427,37 +1427,124 @@ impl App {
 
         let source_summary = describe_torrent_source(&self.torrent_source);
         let output_summary = describe_output_directory(&self.download_dir);
+        let active_style = active_field_style(self.form_field);
+        let source_kind_style = source_kind_style(&source_summary);
+        let source_value_style = source_value_style(&source_summary);
+        let output_value_style = output_value_style(self.download_dir.trim());
 
         let selection = Paragraph::new(Text::from(vec![
-            Line::from(format!("Active field: {}", self.form_field.title())),
+            Line::from(vec![
+                Span::styled("Active ", active_style),
+                Span::styled(
+                    self.form_field.title(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
             Line::from(""),
-            Line::from(format!("Source: {}", source_summary.kind)),
-            Line::from(source_summary.value),
+            Line::from(vec![
+                Span::styled(
+                    "Source ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    source_summary.kind,
+                    source_kind_style.add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(Span::styled(
+                source_summary.value.as_str(),
+                source_value_style,
+            )),
             Line::from(""),
-            Line::from("Output directory:"),
-            Line::from(output_summary),
+            Line::from(Span::styled(
+                "Output directory",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(output_summary.as_str(), output_value_style)),
         ]))
         .wrap(Wrap { trim: true })
-        .block(Block::default().title("Selection").borders(Borders::ALL));
+        .block(
+            Block::default()
+                .title(Line::from(vec![Span::styled(
+                    " Selection ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )]))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
 
         frame.render_widget(selection, chunks[0]);
 
-        let future = Paragraph::new(Text::from(vec![
-            Line::from(format!("Data dir: {}", self.config.data_dir.display())),
-            Line::from(format!(
-                "Incoming .torrent dir: {}",
-                self.config.incoming_torrents_dir.display()
+        let workspace = Paragraph::new(Text::from(vec![
+            Line::from(Span::styled(
+                "Session folders on disk",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
             )),
             Line::from(""),
-            Line::from(format!(
-                "Default downloads: {}",
-                self.config.default_download_dir.display()
-            )),
+            Line::from(vec![
+                Span::styled(
+                    "Data ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    self.config.data_dir.display().to_string(),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "Incoming ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    self.config.incoming_torrents_dir.display().to_string(),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    "Downloads ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    self.config.default_download_dir.display().to_string(),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
         ]))
         .wrap(Wrap { trim: true })
-        .block(Block::default().title("Workspace").borders(Borders::ALL));
+        .block(
+            Block::default()
+                .title(Line::from(vec![Span::styled(
+                    " Workspace ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )]))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
 
-        frame.render_widget(future, chunks[1]);
+        frame.render_widget(workspace, chunks[1]);
     }
 
     fn render_downloads(&mut self, frame: &mut Frame, area: Rect) {
@@ -2379,6 +2466,43 @@ impl TorrentSnapshot {
 struct SourceSummary {
     kind: &'static str,
     value: String,
+}
+
+fn active_field_style(field: FormField) -> Style {
+    match field {
+        FormField::TorrentSource => Style::default().fg(Color::Yellow),
+        FormField::DownloadDir => Style::default().fg(Color::Green),
+    }
+}
+
+fn source_kind_style(summary: &SourceSummary) -> Style {
+    match summary.kind {
+        "remote URL" => Style::default().fg(Color::Cyan),
+        "magnet link" => Style::default().fg(Color::Yellow),
+        "local file" | "directory" | "local path" => Style::default().fg(Color::Green),
+        "invalid" => Style::default().fg(Color::Red),
+        _ => Style::default().fg(Color::DarkGray),
+    }
+}
+
+fn source_value_style(summary: &SourceSummary) -> Style {
+    match summary.kind {
+        "invalid" => Style::default().fg(Color::Red),
+        "not set" => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+        _ => Style::default().fg(Color::White),
+    }
+}
+
+fn output_value_style(raw_input: &str) -> Style {
+    if raw_input.is_empty() {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default().fg(Color::White)
+    }
 }
 
 fn describe_torrent_source(input: &str) -> SourceSummary {
