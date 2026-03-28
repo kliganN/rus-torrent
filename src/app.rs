@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
     DefaultTerminal, Frame,
 };
 use std::time::Duration;
@@ -23,6 +23,7 @@ pub struct App {
     config: AppConfig,
     engine: TorrentEngine,
     downloads: Vec<TorrentSnapshot>,
+    total_downloads: usize,
     menu_state: ListState,
     downloads_state: ListState,
     focus: FocusArea,
@@ -30,6 +31,8 @@ pub struct App {
     torrent_source: String,
     download_dir: String,
     completion_state: Option<CompletionState>,
+    downloads_view: DownloadsView,
+    modal: Option<ModalState>,
     status_line: String,
     should_quit: bool,
 }
@@ -75,6 +78,48 @@ struct CompletionPreview {
     total_matches: usize,
 }
 
+#[derive(Clone, Debug, Default)]
+struct DownloadsView {
+    filter_query: String,
+    sort_field: DownloadSortField,
+    sort_direction: SortDirection,
+    display_mode: DownloadDisplayMode,
+}
+
+impl DownloadsView {
+    fn filter_summary(&self) -> String {
+        let filter = self.filter_query.trim();
+        if filter.is_empty() {
+            "all torrents".to_string()
+        } else {
+            format!("\"{filter}\"")
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ModalState {
+    Help,
+    FilterInput {
+        value: String,
+    },
+    SortPicker {
+        selected: usize,
+        direction: SortDirection,
+    },
+    Confirm(ConfirmState),
+}
+
+#[derive(Clone, Debug)]
+struct ConfirmState {
+    action: ConfirmAction,
+    selected: ConfirmChoice,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompletionDirection {
     Forward,
@@ -100,6 +145,43 @@ enum Screen {
     Server = 2,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DownloadSortField {
+    #[default]
+    Added,
+    Speed,
+    Progress,
+    Name,
+    State,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SortDirection {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DownloadDisplayMode {
+    Compact,
+    #[default]
+    Expanded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfirmAction {
+    ExitApp,
+    ClearFilter,
+    ResetDownloadsView,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfirmChoice {
+    Confirm,
+    Cancel,
+}
+
 impl App {
     pub fn new(config: AppConfig, engine: TorrentEngine) -> Self {
         let mut menu_state = ListState::default();
@@ -114,12 +196,15 @@ impl App {
             config,
             engine,
             downloads: Vec::new(),
+            total_downloads: 0,
             menu_state,
             downloads_state: ListState::default(),
             focus: FocusArea::Content,
             form_field: FormField::TorrentSource,
             torrent_source: String::new(),
             completion_state: None,
+            downloads_view: DownloadsView::default(),
+            modal: None,
             should_quit: false,
         }
     }
@@ -150,6 +235,22 @@ impl App {
                 && matches!(key.code, KeyCode::Char('c')))
         {
             self.should_quit = true;
+            return Ok(());
+        }
+
+        if self.modal.is_some() {
+            return self.handle_modal_key(key);
+        }
+
+        if matches!(key.code, KeyCode::F(1)) {
+            self.open_help_popup();
+            return Ok(());
+        }
+
+        if matches!(key.code, KeyCode::Char('q'))
+            && !(self.focus == FocusArea::Content && self.current_screen() == Screen::AddTorrent)
+        {
+            self.open_confirm(ConfirmAction::ExitApp);
             return Ok(());
         }
 
@@ -185,10 +286,143 @@ impl App {
         }
     }
 
+    fn handle_modal_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(modal) = self.modal.take() else {
+            return Ok(());
+        };
+
+        match modal {
+            ModalState::Help => match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::F(1) => {
+                    self.status_line = "Help closed".to_string();
+                }
+                _ => self.modal = Some(ModalState::Help),
+            },
+            ModalState::FilterInput { mut value } => match key.code {
+                KeyCode::Esc => {
+                    self.status_line = "Filter update cancelled".to_string();
+                }
+                KeyCode::Enter => {
+                    self.downloads_view.filter_query = value.trim().to_string();
+                    self.refresh_downloads();
+                    if self.downloads_view.filter_query.is_empty() {
+                        self.status_line = format!(
+                            "Downloads filter cleared: showing {}/{} torrents",
+                            self.downloads.len(),
+                            self.total_downloads
+                        );
+                    } else {
+                        self.status_line = format!(
+                            "Downloads filter set to {}: showing {}/{} torrents",
+                            self.downloads_view.filter_summary(),
+                            self.downloads.len(),
+                            self.total_downloads
+                        );
+                    }
+                }
+                KeyCode::Backspace => {
+                    value.pop();
+                    self.modal = Some(ModalState::FilterInput { value });
+                }
+                KeyCode::Delete => {
+                    value.clear();
+                    self.modal = Some(ModalState::FilterInput { value });
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    value.clear();
+                    self.modal = Some(ModalState::FilterInput { value });
+                }
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    value.push(ch);
+                    self.modal = Some(ModalState::FilterInput { value });
+                }
+                _ => self.modal = Some(ModalState::FilterInput { value }),
+            },
+            ModalState::SortPicker {
+                mut selected,
+                mut direction,
+            } => {
+                let options = DownloadSortField::all();
+                match key.code {
+                    KeyCode::Esc => {
+                        self.status_line = "Sort dialog closed".to_string();
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        selected = selected.saturating_sub(1);
+                        self.modal = Some(ModalState::SortPicker {
+                            selected,
+                            direction,
+                        });
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        selected = (selected + 1).min(options.len() - 1);
+                        self.modal = Some(ModalState::SortPicker {
+                            selected,
+                            direction,
+                        });
+                    }
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char('r') => {
+                        direction.toggle();
+                        self.modal = Some(ModalState::SortPicker {
+                            selected,
+                            direction,
+                        });
+                    }
+                    KeyCode::Enter => {
+                        let field = options[selected];
+                        self.downloads_view.sort_field = field;
+                        self.downloads_view.sort_direction = direction;
+                        self.refresh_downloads();
+                        self.status_line = format!(
+                            "Downloads sorted by {} ({})",
+                            field.title(),
+                            direction.title()
+                        );
+                    }
+                    _ => {
+                        self.modal = Some(ModalState::SortPicker {
+                            selected,
+                            direction,
+                        });
+                    }
+                }
+            }
+            ModalState::Confirm(mut confirm) => match key.code {
+                KeyCode::Esc => {
+                    self.status_line = format!("{} cancelled", confirm.action.title());
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                    confirm.selected.toggle();
+                    self.modal = Some(ModalState::Confirm(confirm));
+                }
+                KeyCode::Enter => {
+                    if confirm.selected == ConfirmChoice::Confirm {
+                        self.apply_confirm_action(confirm.action);
+                    } else {
+                        self.status_line = format!("{} cancelled", confirm.action.title());
+                    }
+                }
+                KeyCode::Char('y') => self.apply_confirm_action(confirm.action),
+                KeyCode::Char('n') => {
+                    self.status_line = format!("{} cancelled", confirm.action.title());
+                }
+                _ => self.modal = Some(ModalState::Confirm(confirm)),
+            },
+        }
+
+        Ok(())
+    }
+
     fn handle_menu_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Up => self.select_previous_screen(),
-            KeyCode::Down => self.select_next_screen(),
+            KeyCode::Up | KeyCode::Char('k') => self.select_previous_screen(),
+            KeyCode::Down | KeyCode::Char('j') => self.select_next_screen(),
+            KeyCode::Home => self.set_screen(Screen::AddTorrent),
+            KeyCode::End => self.set_screen(Screen::Server),
             KeyCode::Enter => self.focus = FocusArea::Content,
             _ => {}
         }
@@ -217,21 +451,17 @@ impl App {
     }
 
     fn handle_downloads_key(&mut self, key: KeyEvent) {
-        if self.downloads.is_empty() {
-            return;
-        }
-
-        let current = self.downloads_state.selected().unwrap_or(0);
-
         match key.code {
-            KeyCode::Up => {
-                let next = current.saturating_sub(1);
-                self.downloads_state.select(Some(next));
-            }
-            KeyCode::Down => {
-                let next = (current + 1).min(self.downloads.len().saturating_sub(1));
-                self.downloads_state.select(Some(next));
-            }
+            KeyCode::Up | KeyCode::Char('k') => self.select_previous_download(),
+            KeyCode::Down | KeyCode::Char('j') => self.select_next_download(),
+            KeyCode::Home | KeyCode::Char('g') => self.select_first_download(),
+            KeyCode::End | KeyCode::Char('G') => self.select_last_download(),
+            KeyCode::Char('/') => self.open_filter_dialog(),
+            KeyCode::Char('s') => self.open_sort_dialog(),
+            KeyCode::Char('r') => self.reverse_sort_direction(),
+            KeyCode::Char('m') => self.toggle_download_display_mode(),
+            KeyCode::Char('c') => self.confirm_clear_filter(),
+            KeyCode::Char('x') => self.open_confirm(ConfirmAction::ResetDownloadsView),
             _ => {}
         }
     }
@@ -335,16 +565,23 @@ impl App {
     }
 
     fn refresh_downloads(&mut self) {
-        self.downloads = self.engine.list_downloads();
+        let selected_id = self.selected_download_id();
+        let filter_terms = self.download_filter_terms();
+        let mut downloads = self.engine.list_downloads();
+        self.total_downloads = downloads.len();
+        downloads.retain(|download| Self::matches_download_filter(download, &filter_terms));
+        self.sort_downloads(&mut downloads);
+        self.downloads = downloads;
 
         if self.downloads.is_empty() {
             self.downloads_state.select(None);
             return;
         }
 
-        let selected = self.downloads_state.selected().unwrap_or(0);
-        let clamped = selected.min(self.downloads.len() - 1);
-        self.downloads_state.select(Some(clamped));
+        let selected = selected_id
+            .and_then(|id| self.downloads.iter().position(|download| download.id == id))
+            .unwrap_or(0);
+        self.downloads_state.select(Some(selected));
     }
 
     fn push_active_input(&mut self, character: char) {
@@ -397,12 +634,26 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: &str) {
-        if self.focus != FocusArea::Content || self.current_screen() != Screen::AddTorrent {
+        let sanitized = text.trim_matches(|character| character == '\n' || character == '\r');
+        if sanitized.is_empty() {
             return;
         }
 
-        let sanitized = text.trim_matches(|character| character == '\n' || character == '\r');
-        if sanitized.is_empty() {
+        if let Some(modal) = self.modal.take() {
+            match modal {
+                ModalState::FilterInput { mut value } => {
+                    value.push_str(sanitized);
+                    self.status_line = "Pasted into downloads filter".to_string();
+                    self.modal = Some(ModalState::FilterInput { value });
+                }
+                other => {
+                    self.modal = Some(other);
+                }
+            }
+            return;
+        }
+
+        if self.focus != FocusArea::Content || self.current_screen() != Screen::AddTorrent {
             return;
         }
 
@@ -433,6 +684,191 @@ impl App {
         let current = self.current_screen().index();
         let next = (current + 1).min(Screen::all().len() - 1);
         self.menu_state.select(Some(next));
+    }
+
+    fn selected_download_id(&self) -> Option<usize> {
+        self.downloads_state
+            .selected()
+            .and_then(|index| self.downloads.get(index))
+            .map(|download| download.id)
+    }
+
+    fn select_previous_download(&mut self) {
+        if self.downloads.is_empty() {
+            return;
+        }
+
+        let current = self.downloads_state.selected().unwrap_or(0);
+        self.downloads_state.select(Some(current.saturating_sub(1)));
+    }
+
+    fn select_next_download(&mut self) {
+        if self.downloads.is_empty() {
+            return;
+        }
+
+        let current = self.downloads_state.selected().unwrap_or(0);
+        let next = (current + 1).min(self.downloads.len() - 1);
+        self.downloads_state.select(Some(next));
+    }
+
+    fn select_first_download(&mut self) {
+        if self.downloads.is_empty() {
+            return;
+        }
+
+        self.downloads_state.select(Some(0));
+    }
+
+    fn select_last_download(&mut self) {
+        if self.downloads.is_empty() {
+            return;
+        }
+
+        self.downloads_state.select(Some(self.downloads.len() - 1));
+    }
+
+    fn open_help_popup(&mut self) {
+        self.modal = Some(ModalState::Help);
+        self.status_line = "Help opened".to_string();
+    }
+
+    fn open_filter_dialog(&mut self) {
+        self.modal = Some(ModalState::FilterInput {
+            value: self.downloads_view.filter_query.clone(),
+        });
+        self.status_line = "Editing downloads filter".to_string();
+    }
+
+    fn open_sort_dialog(&mut self) {
+        let selected = DownloadSortField::all()
+            .iter()
+            .position(|field| *field == self.downloads_view.sort_field)
+            .unwrap_or(0);
+        self.modal = Some(ModalState::SortPicker {
+            selected,
+            direction: self.downloads_view.sort_direction,
+        });
+        self.status_line = "Choose downloads sort".to_string();
+    }
+
+    fn open_confirm(&mut self, action: ConfirmAction) {
+        self.modal = Some(ModalState::Confirm(ConfirmState {
+            action,
+            selected: ConfirmChoice::Cancel,
+        }));
+        self.status_line = action.prompt().to_string();
+    }
+
+    fn reverse_sort_direction(&mut self) {
+        self.downloads_view.sort_direction.toggle();
+        self.refresh_downloads();
+        self.status_line = format!(
+            "Sort order switched to {} for {}",
+            self.downloads_view.sort_direction.title(),
+            self.downloads_view.sort_field.title()
+        );
+    }
+
+    fn toggle_download_display_mode(&mut self) {
+        self.downloads_view.display_mode.toggle();
+        self.status_line = format!(
+            "Downloads view switched to {} mode",
+            self.downloads_view.display_mode.title()
+        );
+    }
+
+    fn confirm_clear_filter(&mut self) {
+        if self.downloads_view.filter_query.trim().is_empty() {
+            self.status_line = "Downloads filter is already empty".to_string();
+            return;
+        }
+
+        self.open_confirm(ConfirmAction::ClearFilter);
+    }
+
+    fn apply_confirm_action(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::ExitApp => {
+                self.status_line = "Closing rus-torrent".to_string();
+                self.should_quit = true;
+            }
+            ConfirmAction::ClearFilter => {
+                self.downloads_view.filter_query.clear();
+                self.refresh_downloads();
+                self.status_line = format!(
+                    "Downloads filter cleared: showing {}/{} torrents",
+                    self.downloads.len(),
+                    self.total_downloads
+                );
+            }
+            ConfirmAction::ResetDownloadsView => {
+                self.downloads_view.reset();
+                self.refresh_downloads();
+                self.status_line = format!(
+                    "Downloads view reset to defaults: showing {}/{} torrents",
+                    self.downloads.len(),
+                    self.total_downloads
+                );
+            }
+        }
+    }
+
+    fn download_filter_terms(&self) -> Vec<String> {
+        self.downloads_view
+            .filter_query
+            .split_whitespace()
+            .map(|term| term.to_ascii_lowercase())
+            .collect()
+    }
+
+    fn matches_download_filter(download: &TorrentSnapshot, filter_terms: &[String]) -> bool {
+        if filter_terms.is_empty() {
+            return true;
+        }
+
+        let haystack = format!(
+            "{} {} {} {}",
+            download.name.to_ascii_lowercase(),
+            download.state.to_ascii_lowercase(),
+            download.source.to_ascii_lowercase(),
+            download
+                .output_dir
+                .display()
+                .to_string()
+                .to_ascii_lowercase()
+        );
+
+        filter_terms
+            .iter()
+            .all(|term| haystack.contains(term.as_str()))
+    }
+
+    fn sort_downloads(&self, downloads: &mut [TorrentSnapshot]) {
+        downloads.sort_by(|left, right| {
+            let ordering = match self.downloads_view.sort_field {
+                DownloadSortField::Added => left.id.cmp(&right.id),
+                DownloadSortField::Speed => {
+                    left.download_speed_mib.total_cmp(&right.download_speed_mib)
+                }
+                DownloadSortField::Progress => left.progress_ratio.total_cmp(&right.progress_ratio),
+                DownloadSortField::Name => left
+                    .name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase()),
+                DownloadSortField::State => left
+                    .state
+                    .to_ascii_lowercase()
+                    .cmp(&right.state.to_ascii_lowercase()),
+            };
+
+            let ordering = match self.downloads_view.sort_direction {
+                SortDirection::Ascending => ordering,
+                SortDirection::Descending => ordering.reverse(),
+            };
+
+            ordering.then_with(|| left.id.cmp(&right.id))
+        });
     }
 
     fn completion_preview(&self) -> Result<CompletionPreview> {
@@ -508,7 +944,7 @@ impl App {
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(0),
-                Constraint::Length(4),
+                Constraint::Length(5),
             ])
             .split(frame.area());
 
@@ -528,6 +964,7 @@ impl App {
         }
 
         self.render_footer(frame, root[2]);
+        self.render_modal(frame);
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -536,7 +973,7 @@ impl App {
             FocusArea::Content => "content",
         };
 
-        let header = Paragraph::new(Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 "rus-torrent",
                 Style::default()
@@ -545,7 +982,7 @@ impl App {
             ),
             Span::raw("  "),
             Span::styled(
-                "Interactive torrent client",
+                format!("screen: {}", self.current_screen().title()),
                 Style::default().fg(Color::White),
             ),
             Span::raw("  "),
@@ -553,8 +990,18 @@ impl App {
                 format!("focus: {focus}"),
                 Style::default().fg(Color::Yellow),
             ),
-        ]))
-        .block(Block::default().borders(Borders::ALL).title("Overview"));
+        ];
+
+        if let Some(title) = self.active_modal_title() {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("popup: {title}"),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+
+        let header = Paragraph::new(Line::from(spans))
+            .block(Block::default().borders(Borders::ALL).title("Overview"));
 
         frame.render_widget(header, area);
     }
@@ -708,7 +1155,7 @@ impl App {
     fn render_add_help(&self, frame: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(8), Constraint::Min(0)])
+            .constraints([Constraint::Length(9), Constraint::Min(0)])
             .split(area);
 
         let controls = Paragraph::new(Text::from(vec![
@@ -719,6 +1166,7 @@ impl App {
             Line::from("Empty field + Tab: browse from /"),
             Line::from("Paste: local path, HTTP/HTTPS .torrent URL, or magnet link"),
             Line::from("Enter: add torrent"),
+            Line::from("F1: open help popup"),
             Line::from("Esc: return to menu"),
         ]))
         .wrap(Wrap { trim: true })
@@ -740,27 +1188,49 @@ impl App {
     }
 
     fn render_downloads(&mut self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(area);
+
+        self.render_downloads_toolbar(frame, chunks[0]);
+
         if self.downloads.is_empty() {
-            let empty = Paragraph::new(Text::from(vec![
-                Line::from("No torrents have been added yet."),
-                Line::from("Open 'Choose torrent source' and queue a source."),
-            ]))
-            .wrap(Wrap { trim: true })
-            .block(Block::default().title("Downloads").borders(Borders::ALL));
-            frame.render_widget(empty, area);
+            self.render_downloads_empty(frame, chunks[1]);
             return;
         }
 
-        let chunks = Layout::default()
+        let body = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
-            .split(area);
+            .constraints(match self.downloads_view.display_mode {
+                DownloadDisplayMode::Compact => {
+                    [Constraint::Percentage(46), Constraint::Percentage(54)]
+                }
+                DownloadDisplayMode::Expanded => {
+                    [Constraint::Percentage(52), Constraint::Percentage(48)]
+                }
+            })
+            .split(chunks[1]);
 
         let items = self
             .downloads
             .iter()
-            .map(|download| {
-                ListItem::new(vec![
+            .map(|download| match self.downloads_view.display_mode {
+                DownloadDisplayMode::Compact => ListItem::new(Line::from(vec![
+                    Span::styled(
+                        download.name.as_str(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!(
+                        "  #{:02}  {:.1}%  {}  ↓ {}  peers {}",
+                        download.id,
+                        download.progress_ratio * 100.0,
+                        download.state,
+                        download.download_speed.as_deref().unwrap_or("n/a"),
+                        download.live_peers
+                    )),
+                ])),
+                DownloadDisplayMode::Expanded => ListItem::new(vec![
                     Line::from(download.name.as_str()),
                     Line::from(format!(
                         "#{}  {}  {:.1}%",
@@ -773,7 +1243,7 @@ impl App {
                         download.download_speed.as_deref().unwrap_or("n/a"),
                         download.live_peers
                     )),
-                ])
+                ]),
             })
             .collect::<Vec<_>>();
 
@@ -786,7 +1256,7 @@ impl App {
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title("Active Downloads")
+                    .title(self.downloads_list_title())
                     .borders(Borders::ALL)
                     .border_style(border_style),
             )
@@ -798,7 +1268,7 @@ impl App {
             )
             .highlight_symbol(">> ");
 
-        frame.render_stateful_widget(list, chunks[0], &mut self.downloads_state);
+        frame.render_stateful_widget(list, body[0], &mut self.downloads_state);
 
         let selected = self
             .downloads_state
@@ -813,7 +1283,7 @@ impl App {
                     Constraint::Length(13),
                     Constraint::Min(0),
                 ])
-                .split(chunks[1]);
+                .split(body[1]);
 
             let label = if download.total_bytes == 0 {
                 "Waiting for metadata".to_string()
@@ -888,6 +1358,58 @@ impl App {
         }
     }
 
+    fn render_downloads_toolbar(&self, frame: &mut Frame, area: Rect) {
+        let summary = Paragraph::new(Line::from(vec![
+            Span::styled("Visible ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{}/{}", self.downloads.len(), self.total_downloads)),
+            Span::raw("  "),
+            Span::styled("Filter ", Style::default().fg(Color::Cyan)),
+            Span::raw(self.downloads_view.filter_summary()),
+            Span::raw("  "),
+            Span::styled("Sort ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!(
+                "{} ({})",
+                self.downloads_view.sort_field.title(),
+                self.downloads_view.sort_direction.title()
+            )),
+            Span::raw("  "),
+            Span::styled("Mode ", Style::default().fg(Color::Cyan)),
+            Span::raw(self.downloads_view.display_mode.title()),
+        ]))
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .title("Downloads View")
+                .borders(Borders::ALL),
+        );
+
+        frame.render_widget(summary, area);
+    }
+
+    fn render_downloads_empty(&self, frame: &mut Frame, area: Rect) {
+        let text = if self.total_downloads == 0 {
+            Text::from(vec![
+                Line::from("No torrents have been added yet."),
+                Line::from("Open 'Choose torrent source' and queue a source."),
+                Line::from("F1 opens the full hotkey reference."),
+            ])
+        } else {
+            Text::from(vec![
+                Line::from("No downloads match the current filter."),
+                Line::from(format!(
+                    "Current filter: {}",
+                    self.downloads_view.filter_summary()
+                )),
+                Line::from("Press / to edit the filter, or c to clear it."),
+            ])
+        };
+
+        let empty = Paragraph::new(text)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().title("Downloads").borders(Borders::ALL));
+        frame.render_widget(empty, area);
+    }
+
     fn render_server(&self, frame: &mut Frame, area: Rect) {
         let lines = vec![
             Line::from("This screen keeps the integration points for server-side automation."),
@@ -917,15 +1439,7 @@ impl App {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let help = match self.current_screen() {
-            Screen::AddTorrent => {
-                "Left/Right focus | Tab local completion | Up/Down switch field | Enter add torrent | Esc menu | Ctrl+C/F10 exit"
-            }
-            Screen::Downloads => {
-                "Left/Right focus | Up/Down select torrent | Esc menu | Ctrl+C/F10 exit"
-            }
-            Screen::Server => "Left/Right focus | Esc menu | Ctrl+C/F10 exit",
-        };
+        let help = self.footer_help_text();
 
         let footer = Paragraph::new(Text::from(vec![
             Line::from(self.status_line.as_str()),
@@ -935,6 +1449,264 @@ impl App {
         .block(Block::default().title("Status").borders(Borders::ALL));
 
         frame.render_widget(footer, area);
+    }
+
+    fn render_modal(&self, frame: &mut Frame) {
+        match &self.modal {
+            Some(ModalState::Help) => self.render_help_popup(frame),
+            Some(ModalState::FilterInput { value }) => self.render_filter_popup(frame, value),
+            Some(ModalState::SortPicker {
+                selected,
+                direction,
+            }) => self.render_sort_popup(frame, *selected, *direction),
+            Some(ModalState::Confirm(confirm)) => self.render_confirm_popup(frame, confirm),
+            None => {}
+        }
+    }
+
+    fn render_help_popup(&self, frame: &mut Frame) {
+        let area = centered_rect(74, 72, frame.area());
+        frame.render_widget(Clear, area);
+
+        let popup = Paragraph::new(Text::from(vec![
+            Line::styled(
+                "Global",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::from("F1: open or close help"),
+            Line::from("Left/Right: move focus between menu and content"),
+            Line::from("Ctrl+C or F10: force exit immediately"),
+            Line::from(""),
+            Line::styled(
+                "Choose Torrent Source",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::from("Up/Down: switch active field"),
+            Line::from("Tab / Shift+Tab: cycle local path completion"),
+            Line::from("Paste: insert file path, URL, or magnet link"),
+            Line::from("Enter: queue the torrent"),
+            Line::from(""),
+            Line::styled(
+                "Downloads",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::from("Up/Down or j/k: select a torrent"),
+            Line::from("Home/End or g/G: jump to first or last torrent"),
+            Line::from("/: open search/filter dialog"),
+            Line::from("s: open sort dialog"),
+            Line::from("r: reverse current sort order"),
+            Line::from("m: toggle compact and expanded list modes"),
+            Line::from("c: clear filter with confirmation"),
+            Line::from("x: reset filter, sort, and layout with confirmation"),
+            Line::from("q: quit with confirmation"),
+            Line::from(""),
+            Line::styled(
+                "Popups",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::from("Enter: apply or confirm"),
+            Line::from("Esc: close or cancel"),
+            Line::from("Filter dialog: Ctrl+U/Delete clears the current input"),
+        ]))
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .title("Hotkeys and Popups")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+
+        frame.render_widget(popup, area);
+    }
+
+    fn render_filter_popup(&self, frame: &mut Frame, value: &str) {
+        let area = centered_rect(64, 34, frame.area());
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Block::default()
+                .title("Filter Downloads")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+            area,
+        );
+
+        let inner = inner_rect(area);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(inner);
+
+        let content = if value.is_empty() {
+            Line::from(Span::styled(
+                "Type terms to match name, state, source, or output directory",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ))
+        } else {
+            Line::from(value.to_string())
+        };
+
+        let input = Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title("Query").borders(Borders::ALL));
+        frame.render_widget(input, chunks[0]);
+
+        let help = Paragraph::new(Text::from(vec![
+            Line::from("Filtering is case-insensitive."),
+            Line::from("Separate multiple terms with spaces; every term must match."),
+            Line::from("Enter: apply filter"),
+            Line::from("Esc: cancel"),
+            Line::from("Ctrl+U or Delete: clear the input"),
+        ]))
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .title("Matching Rules")
+                .borders(Borders::ALL),
+        );
+        frame.render_widget(help, chunks[1]);
+    }
+
+    fn render_sort_popup(&self, frame: &mut Frame, selected: usize, direction: SortDirection) {
+        let area = centered_rect(64, 56, frame.area());
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Block::default()
+                .title("Sort Downloads")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+            area,
+        );
+
+        let inner = inner_rect(area);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(5),
+            ])
+            .split(inner);
+
+        let order = Paragraph::new(Line::from(vec![
+            Span::styled("Direction ", Style::default().fg(Color::Cyan)),
+            Span::raw(direction.title()),
+            Span::raw("  "),
+            Span::styled("Current ", Style::default().fg(Color::Cyan)),
+            Span::raw(self.downloads_view.sort_field.title()),
+        ]))
+        .wrap(Wrap { trim: true })
+        .block(Block::default().title("Order").borders(Borders::ALL));
+        frame.render_widget(order, chunks[0]);
+
+        let items = DownloadSortField::all()
+            .iter()
+            .map(|field| {
+                let suffix = if *field == self.downloads_view.sort_field {
+                    " (current)"
+                } else {
+                    ""
+                };
+                ListItem::new(vec![
+                    Line::from(format!("{}{}", field.title(), suffix)),
+                    Line::from(Span::styled(
+                        field.description(),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ])
+            })
+            .collect::<Vec<_>>();
+
+        let mut list_state = ListState::default();
+        list_state.select(Some(selected));
+
+        let list = List::new(items)
+            .block(Block::default().title("Sort Field").borders(Borders::ALL))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol(">> ");
+        frame.render_stateful_widget(list, chunks[1], &mut list_state);
+
+        let help = Paragraph::new(Text::from(vec![
+            Line::from("Up/Down or j/k: choose a sort field"),
+            Line::from("Left/Right or r: toggle ascending / descending"),
+            Line::from("Enter: apply"),
+            Line::from("Esc: cancel"),
+        ]))
+        .wrap(Wrap { trim: true })
+        .block(Block::default().title("Controls").borders(Borders::ALL));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn render_confirm_popup(&self, frame: &mut Frame, confirm: &ConfirmState) {
+        let area = centered_rect(56, 28, frame.area());
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Block::default()
+                .title(confirm.action.title())
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+            area,
+        );
+
+        let inner = inner_rect(area);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(3)])
+            .split(inner);
+
+        let message = Paragraph::new(self.confirm_text(confirm.action))
+            .wrap(Wrap { trim: true })
+            .block(Block::default().title("Confirm").borders(Borders::ALL));
+        frame.render_widget(message, chunks[0]);
+
+        let cancel_style = if confirm.selected == ConfirmChoice::Cancel {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+
+        let confirm_style = if confirm.selected == ConfirmChoice::Confirm {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+
+        let buttons = Paragraph::new(Line::from(vec![
+            Span::styled(" Cancel ", cancel_style),
+            Span::raw("  "),
+            Span::styled(
+                format!(" {} ", confirm.action.confirm_label()),
+                confirm_style,
+            ),
+            Span::raw("  "),
+            Span::styled("Enter", Style::default().fg(Color::Cyan)),
+            Span::raw(" apply  "),
+            Span::styled("Esc", Style::default().fg(Color::Cyan)),
+            Span::raw(" cancel"),
+        ]))
+        .wrap(Wrap { trim: true })
+        .block(Block::default().title("Choice").borders(Borders::ALL));
+        frame.render_widget(buttons, chunks[1]);
     }
 
     fn render_input(
@@ -973,6 +1745,75 @@ impl App {
             .wrap(Wrap { trim: false });
 
         frame.render_widget(input, area);
+    }
+
+    fn downloads_list_title(&self) -> String {
+        if self.total_downloads == self.downloads.len() {
+            format!("Active Downloads ({})", self.downloads.len())
+        } else {
+            format!(
+                "Active Downloads ({}/{} shown)",
+                self.downloads.len(),
+                self.total_downloads
+            )
+        }
+    }
+
+    fn footer_help_text(&self) -> &'static str {
+        if let Some(modal) = &self.modal {
+            return match modal {
+                ModalState::Help => "F1/Esc/Enter close help | Ctrl+C/F10 force exit",
+                ModalState::FilterInput { .. } => {
+                    "Type terms | Enter apply filter | Ctrl+U/Delete clear | Esc cancel"
+                }
+                ModalState::SortPicker { .. } => {
+                    "Up/Down choose field | Left/Right toggle order | Enter apply | Esc cancel"
+                }
+                ModalState::Confirm(_) => {
+                    "Left/Right or Tab choose | Enter confirm | y/n quick answer | Esc cancel"
+                }
+            };
+        }
+
+        match self.current_screen() {
+            Screen::AddTorrent => {
+                "F1 help | Tab local completion | Up/Down switch field | Enter add torrent | Esc menu"
+            }
+            Screen::Downloads => {
+                "F1 help | / filter | s sort | r reverse | m mode | c clear | x reset | q quit"
+            }
+            Screen::Server => "F1 help | Left/Right focus | Esc menu | q quit",
+        }
+    }
+
+    fn active_modal_title(&self) -> Option<&'static str> {
+        match &self.modal {
+            Some(ModalState::Help) => Some("help"),
+            Some(ModalState::FilterInput { .. }) => Some("filter"),
+            Some(ModalState::SortPicker { .. }) => Some("sort"),
+            Some(ModalState::Confirm(_)) => Some("confirm"),
+            None => None,
+        }
+    }
+
+    fn confirm_text(&self, action: ConfirmAction) -> Text<'static> {
+        match action {
+            ConfirmAction::ExitApp => Text::from(vec![
+                Line::from("Close rus-torrent now?"),
+                Line::from("The current in-memory session will stop with the process."),
+            ]),
+            ConfirmAction::ClearFilter => Text::from(vec![
+                Line::from("Clear the current downloads filter?"),
+                Line::from(format!(
+                    "Current filter: {}",
+                    self.downloads_view.filter_summary()
+                )),
+            ]),
+            ConfirmAction::ResetDownloadsView => Text::from(vec![
+                Line::from("Reset filter, sort order, and layout to defaults?"),
+                Line::from("Defaults: added order, ascending, expanded mode."),
+            ]),
+        }
     }
 }
 
@@ -1059,6 +1900,105 @@ impl Screen {
     }
 }
 
+impl DownloadSortField {
+    fn all() -> [Self; 5] {
+        [
+            Self::Added,
+            Self::Speed,
+            Self::Progress,
+            Self::Name,
+            Self::State,
+        ]
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Added => "Added order",
+            Self::Speed => "Download speed",
+            Self::Progress => "Progress",
+            Self::Name => "Name",
+            Self::State => "State",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Added => "Order by torrent id so the queue looks like submission history.",
+            Self::Speed => "Highest or lowest live download speed first.",
+            Self::Progress => "Sort by completed percentage.",
+            Self::Name => "Alphabetical order by torrent name.",
+            Self::State => "Group torrents by current runtime state text.",
+        }
+    }
+}
+
+impl SortDirection {
+    fn toggle(&mut self) {
+        *self = match self {
+            Self::Ascending => Self::Descending,
+            Self::Descending => Self::Ascending,
+        };
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Ascending => "ascending",
+            Self::Descending => "descending",
+        }
+    }
+}
+
+impl DownloadDisplayMode {
+    fn toggle(&mut self) {
+        *self = match self {
+            Self::Compact => Self::Expanded,
+            Self::Expanded => Self::Compact,
+        };
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Expanded => "expanded",
+        }
+    }
+}
+
+impl ConfirmAction {
+    fn title(self) -> &'static str {
+        match self {
+            Self::ExitApp => "Exit Application",
+            Self::ClearFilter => "Clear Filter",
+            Self::ResetDownloadsView => "Reset Downloads View",
+        }
+    }
+
+    fn confirm_label(self) -> &'static str {
+        match self {
+            Self::ExitApp => "Exit",
+            Self::ClearFilter => "Clear",
+            Self::ResetDownloadsView => "Reset",
+        }
+    }
+
+    fn prompt(self) -> &'static str {
+        match self {
+            Self::ExitApp => "Exit confirmation opened",
+            Self::ClearFilter => "Clear filter confirmation opened",
+            Self::ResetDownloadsView => "Reset view confirmation opened",
+        }
+    }
+}
+
+impl ConfirmChoice {
+    fn toggle(&mut self) {
+        *self = match self {
+            Self::Confirm => Self::Cancel,
+            Self::Cancel => Self::Confirm,
+        };
+    }
+}
+
 fn completion_window(total_items: usize, selected: Option<usize>) -> (usize, usize) {
     if total_items <= MAX_VISIBLE_COMPLETIONS {
         return (0, total_items);
@@ -1077,4 +2017,33 @@ fn completion_window(total_items: usize, selected: Option<usize>) -> (usize, usi
     }
 
     (start, end)
+}
+
+fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height_percent) / 2),
+            Constraint::Percentage(height_percent),
+            Constraint::Percentage((100 - height_percent) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width_percent) / 2),
+            Constraint::Percentage(width_percent),
+            Constraint::Percentage((100 - width_percent) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn inner_rect(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
 }

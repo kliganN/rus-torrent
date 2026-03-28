@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
+use serde::Serialize;
 use std::{env, fs, path::PathBuf};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct AppConfig {
     pub data_dir: PathBuf,
     pub default_download_dir: PathBuf,
@@ -14,6 +15,10 @@ impl AppConfig {
             .context("failed to determine the current working directory")?
             .join("rus-torrent-data");
 
+        Self::discover_in(data_dir)
+    }
+
+    pub fn discover_in(data_dir: PathBuf) -> Result<Self> {
         let config = Self {
             default_download_dir: data_dir.join("downloads"),
             incoming_torrents_dir: data_dir.join("incoming-torrents"),

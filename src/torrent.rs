@@ -1,6 +1,7 @@
 use crate::path_completion::resolve_user_path;
 use anyhow::{anyhow, Context, Result};
 use librqbit::{AddTorrent, AddTorrentOptions, Session};
+use serde::Serialize;
 use std::{
     collections::HashMap,
     ffi::OsStr,
@@ -21,7 +22,7 @@ struct TorrentRegistration {
     submitted_name: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct TorrentSnapshot {
     pub id: usize,
     pub name: String,
@@ -34,6 +35,7 @@ pub struct TorrentSnapshot {
     pub error: Option<String>,
     pub download_speed: Option<String>,
     pub upload_speed: Option<String>,
+    pub download_speed_mib: f64,
     pub live_peers: usize,
     pub connecting_peers: usize,
     pub seen_peers: usize,
@@ -196,17 +198,24 @@ impl TorrentEngine {
 
             for (id, handle) in torrents {
                 let stats = handle.stats();
-                let (download_speed, upload_speed, live_peers, connecting_peers, seen_peers) =
-                    match stats.live.as_ref() {
-                        Some(live) => (
-                            Some(live.download_speed.to_string()),
-                            Some(live.upload_speed.to_string()),
-                            live.snapshot.peer_stats.live,
-                            live.snapshot.peer_stats.connecting,
-                            live.snapshot.peer_stats.seen,
-                        ),
-                        None => (None, None, 0, 0, 0),
-                    };
+                let (
+                    download_speed,
+                    upload_speed,
+                    download_speed_mib,
+                    live_peers,
+                    connecting_peers,
+                    seen_peers,
+                ) = match stats.live.as_ref() {
+                    Some(live) => (
+                        Some(live.download_speed.to_string()),
+                        Some(live.upload_speed.to_string()),
+                        live.download_speed.mbps,
+                        live.snapshot.peer_stats.live,
+                        live.snapshot.peer_stats.connecting,
+                        live.snapshot.peer_stats.seen,
+                    ),
+                    None => (None, None, 0.0, 0, 0, 0),
+                };
                 let registration = registrations.get(&id).cloned().unwrap_or_else(|| {
                     let fallback_name = handle
                         .name()
@@ -239,6 +248,7 @@ impl TorrentEngine {
                     error: stats.error.clone(),
                     download_speed,
                     upload_speed,
+                    download_speed_mib,
                     live_peers,
                     connecting_peers,
                     seen_peers,

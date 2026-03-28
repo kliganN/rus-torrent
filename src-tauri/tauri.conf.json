@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "rus-torrent",
+  "version": "0.1.0",
+  "identifier": "com.kligann.rus-torrent",
+  "build": {
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "rus-torrent",
+        "width": 1440,
+        "height": 960,
+        "minWidth": 1120,
+        "minHeight": 760,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "publisher": "kligann",
+    "shortDescription": "Desktop BitTorrent client for local torrent files, URLs, and magnet links.",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "offlineInstaller",
+        "silent": true
+      }
+    }
+  }
+}

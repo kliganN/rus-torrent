@@ -2452,6 +2452,7 @@ dependencies = [
  "crossterm",
  "librqbit",
  "ratatui",
+ "serde",
  "tokio",
 ]
 
