@@ -15,11 +15,22 @@ pub enum PathCompletionMode {
 pub struct CompletionCandidate {
     pub replacement: String,
     pub is_dir: bool,
+    pub is_remote_hint: bool,
 }
 
 impl CompletionCandidate {
+    pub fn remote_hint() -> Self {
+        Self {
+            replacement: "URL/magnet".to_string(),
+            is_dir: false,
+            is_remote_hint: true,
+        }
+    }
+
     pub fn kind_label(&self) -> &'static str {
-        if self.is_dir {
+        if self.is_remote_hint {
+            "link"
+        } else if self.is_dir {
             "dir"
         } else {
             "torrent"
@@ -94,6 +105,7 @@ pub fn collect_candidates(input: &str, mode: PathCompletionMode) -> Result<Compl
         candidates.push(CompletionCandidate {
             replacement,
             is_dir,
+            is_remote_hint: false,
         });
     }
 

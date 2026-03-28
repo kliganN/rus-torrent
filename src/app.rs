@@ -1,7 +1,8 @@
 use crate::{
     config::AppConfig,
     path_completion::{
-        collect_candidates, resolve_user_path, CompletionCandidate, PathCompletionMode,
+        collect_candidates, resolve_user_path, CompletionCandidate, CompletionSet,
+        PathCompletionMode,
     },
     torrent::{format_bytes, TorrentEngine, TorrentSnapshot, TorrentSource},
 };
@@ -483,12 +484,15 @@ impl App {
             KeyCode::Up => self.move_browser_selection(CompletionDirection::Backward)?,
             KeyCode::Down => self.move_browser_selection(CompletionDirection::Forward)?,
             KeyCode::Left => self.browse_parent_directory()?,
-            KeyCode::Right => self.activate_browser_selection()?,
+            KeyCode::F(5) => self.submit_torrent().await?,
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.submit_torrent().await?
+            }
             KeyCode::Tab => self.switch_active_form_field(self.form_field.next()),
             KeyCode::BackTab => self.switch_active_form_field(self.form_field.previous()),
             KeyCode::Backspace => self.pop_active_input(),
             KeyCode::Delete => self.clear_active_input(),
-            KeyCode::Enter => self.submit_torrent().await?,
+            KeyCode::Char(' ') => self.handle_add_selection().await?,
             KeyCode::Char(ch)
                 if !key
                     .modifiers
@@ -508,6 +512,45 @@ impl App {
         self.status_line = format!("Active field: {}", self.form_field.title());
     }
 
+    async fn handle_add_selection(&mut self) -> Result<()> {
+        let field = self.form_field;
+        let current_input = self.active_value(field).trim().to_string();
+
+        if field == FormField::TorrentSource
+            && !current_input.is_empty()
+            && !field.supports_local_completion(&current_input)
+        {
+            self.submit_torrent().await?;
+            return Ok(());
+        }
+
+        let Some(state) = self.load_browser_state(field, &current_input)? else {
+            let can_submit_local_file = field == FormField::TorrentSource
+                && resolve_user_path(&current_input)
+                    .map(|path| path.is_file())
+                    .unwrap_or(false);
+
+            if can_submit_local_file {
+                self.submit_torrent().await?;
+            } else {
+                self.status_line = format!("No {} entries found", field.browser_subject());
+            }
+            return Ok(());
+        };
+
+        let selected = &state.candidates[state.selected];
+        if field == FormField::TorrentSource
+            && !selected.is_dir
+            && !selected.is_remote_hint
+            && selected.replacement == current_input
+        {
+            self.submit_torrent().await?;
+            return Ok(());
+        }
+
+        self.activate_browser_selection()
+    }
+
     async fn handle_downloads_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_download(),
@@ -524,7 +567,7 @@ impl App {
                     self.download_action = self.download_action.next_available(download);
                 }
             }
-            KeyCode::Enter => self.execute_selected_download_action().await?,
+            KeyCode::Char(' ') => self.execute_selected_download_action().await?,
             KeyCode::Char('/') => self.open_filter_dialog(),
             KeyCode::Char('s') => self.open_sort_dialog(),
             KeyCode::Char('r') => self.reverse_sort_direction(),
@@ -575,13 +618,6 @@ impl App {
         let field = self.form_field;
         let current_input = self.active_value(field).trim().to_string();
 
-        if !field.supports_local_completion(&current_input) {
-            self.clear_completion();
-            self.status_line =
-                "Path browser is unavailable for HTTP/HTTPS and magnet sources".to_string();
-            return Ok(());
-        }
-
         let has_existing_state = self
             .completion_state
             .as_ref()
@@ -597,7 +633,7 @@ impl App {
             state.step(direction);
         } else {
             state.selected = match direction {
-                CompletionDirection::Forward => 0,
+                CompletionDirection::Forward => (state.candidates.len() > 1) as usize,
                 CompletionDirection::Backward => state.candidates.len() - 1,
             };
         }
@@ -613,13 +649,6 @@ impl App {
         let field = self.form_field;
         let current_input = self.active_value(field).trim().to_string();
 
-        if !field.supports_local_completion(&current_input) {
-            self.clear_completion();
-            self.status_line =
-                "Path browser is unavailable for HTTP/HTTPS and magnet sources".to_string();
-            return Ok(());
-        }
-
         let Some(state) = self.load_browser_state(field, &current_input)? else {
             self.clear_completion();
             self.status_line = format!("No {} entries found", field.browser_subject());
@@ -630,11 +659,19 @@ impl App {
         let replacement = selected.replacement.clone();
         let is_dir = selected.is_dir;
 
+        if selected.is_remote_hint {
+            self.set_active_value(field, String::new());
+            self.clear_completion();
+            self.status_line = "Paste a URL or magnet link into Source URL/file".to_string();
+            return Ok(());
+        }
+
         self.set_active_value(field, replacement.clone());
-        self.clear_completion();
         self.status_line = if is_dir {
+            self.completion_state = self.load_browser_state(field, &replacement)?;
             format!("Opened {}", replacement)
         } else {
+            self.clear_completion();
             format!("Selected torrent file: {}", replacement)
         };
 
@@ -648,7 +685,8 @@ impl App {
         if !field.supports_local_completion(current_input) {
             self.clear_completion();
             self.status_line =
-                "Path browser is unavailable for HTTP/HTTPS and magnet sources".to_string();
+                "Clear the source field to browse directories or keep pasting a URL/magnet"
+                    .to_string();
             return Ok(());
         }
 
@@ -670,7 +708,7 @@ impl App {
             }
         }
 
-        let completion_set = collect_candidates(self.active_value(field), field.completion_mode())?;
+        let completion_set = self.build_completion_set(field, current_input)?;
         if completion_set.candidates.is_empty() {
             return Ok(None);
         }
@@ -681,6 +719,21 @@ impl App {
             candidates: completion_set.candidates,
             selected: 0,
         }))
+    }
+
+    fn build_completion_set(&self, field: FormField, current_input: &str) -> Result<CompletionSet> {
+        if field == FormField::TorrentSource
+            && (current_input.is_empty() || !field.supports_local_completion(current_input))
+        {
+            let mut completion = collect_candidates("", PathCompletionMode::Directory)?;
+            completion.seed_input = current_input.to_string();
+            completion
+                .candidates
+                .insert(0, CompletionCandidate::remote_hint());
+            return Ok(completion);
+        }
+
+        collect_candidates(self.active_value(field), field.completion_mode())
     }
 
     fn refresh_downloads(&mut self) {
@@ -1088,22 +1141,12 @@ impl App {
         let field = self.form_field;
         let current_input = self.active_value(field).trim();
 
-        if !field.supports_local_completion(current_input) {
-            return Ok(CompletionPreview {
-                candidates: Vec::new(),
-                selected: None,
-                start_index: 0,
-                total_matches: 0,
-            });
-        }
-
         let (candidates, selected) = match &self.completion_state {
             Some(state) if state.can_continue(field, current_input) => {
                 (state.candidates.clone(), Some(state.selected))
             }
             _ => {
-                let completion =
-                    collect_candidates(self.active_value(field), field.completion_mode())?;
+                let completion = self.build_completion_set(field, current_input)?;
                 let selected = (!completion.candidates.is_empty()).then_some(0);
                 (completion.candidates, selected)
             }
@@ -1123,26 +1166,25 @@ impl App {
     }
 
     fn completion_empty_text(&self) -> Text<'static> {
-        if self.form_field == FormField::TorrentSource
-            && !self
-                .form_field
-                .supports_local_completion(self.active_value(self.form_field))
-        {
-            return Text::from(vec![
-                Line::from("This field currently contains a URL or magnet link."),
-                Line::from("Press Enter to start downloading it immediately."),
-                Line::from("The path browser is only available for filesystem paths."),
-            ]);
-        }
+        let current_input = self.active_value(self.form_field).trim();
 
         match self.form_field {
+            FormField::TorrentSource
+                if current_input.is_empty()
+                    || !self.form_field.supports_local_completion(current_input) =>
+            {
+                Text::from(vec![
+                    Line::from("Choose URL/magnet or open one of your home directories."),
+                    Line::from("Space opens the highlighted choice."),
+                ])
+            }
             FormField::TorrentSource => Text::from(vec![
-                Line::from("No local torrent files or folders match the current input."),
-                Line::from("Start typing a path or move to another directory."),
+                Line::from("No directories or .torrent files match the current source path."),
+                Line::from("Space opens a directory or selects the highlighted torrent file."),
             ]),
             FormField::DownloadDir => Text::from(vec![
                 Line::from("No directories match the current input."),
-                Line::from("Start typing a path or move to another directory."),
+                Line::from("Space opens the selected directory."),
             ]),
         }
     }
@@ -1289,7 +1331,7 @@ impl App {
                     .wrap(Wrap { trim: true })
                     .block(
                         Block::default()
-                            .title(format!("{} Browser", self.form_field.short_title()))
+                            .title(self.completion_panel_title())
                             .borders(Borders::ALL),
                     );
                 frame.render_widget(empty, area);
@@ -1304,7 +1346,9 @@ impl App {
                             Span::raw("  "),
                             Span::styled(
                                 format!("[{}]", candidate.kind_label()),
-                                Style::default().fg(if candidate.is_dir {
+                                Style::default().fg(if candidate.is_remote_hint {
+                                    Color::Magenta
+                                } else if candidate.is_dir {
                                     Color::Green
                                 } else {
                                     Color::Blue
@@ -1319,16 +1363,16 @@ impl App {
 
                 let title = if preview.total_matches > preview.candidates.len() {
                     format!(
-                        "{} Browser (showing {}-{} of {})",
-                        self.form_field.short_title(),
+                        "{} (showing {}-{} of {})",
+                        self.completion_panel_title(),
                         preview.start_index + 1,
                         preview.start_index + preview.candidates.len(),
                         preview.total_matches
                     )
                 } else {
                     format!(
-                        "{} Browser ({})",
-                        self.form_field.short_title(),
+                        "{} ({})",
+                        self.completion_panel_title(),
                         preview.total_matches
                     )
                 };
@@ -1347,13 +1391,31 @@ impl App {
             }
             Err(error) => {
                 let message = Paragraph::new(Text::from(vec![
-                    Line::from("Path browser is currently unavailable."),
+                    Line::from(self.completion_unavailable_text()),
                     Line::from(format!("{error:#}")),
                 ]))
                 .wrap(Wrap { trim: true })
-                .block(Block::default().title("Path Browser").borders(Borders::ALL));
+                .block(
+                    Block::default()
+                        .title(self.completion_panel_title())
+                        .borders(Borders::ALL),
+                );
                 frame.render_widget(message, area);
             }
+        }
+    }
+
+    fn completion_panel_title(&self) -> &'static str {
+        match self.form_field {
+            FormField::TorrentSource => "Source URL/file",
+            FormField::DownloadDir => "Choose directory",
+        }
+    }
+
+    fn completion_unavailable_text(&self) -> &'static str {
+        match self.form_field {
+            FormField::TorrentSource => "Source chooser is currently unavailable.",
+            FormField::DownloadDir => "Directory chooser is currently unavailable.",
         }
     }
 
@@ -1728,9 +1790,9 @@ impl App {
             Line::from("Tab / Shift+Tab: switch active field"),
             Line::from("Up/Down: move browser selection"),
             Line::from("Left: parent directory"),
-            Line::from("Right: open highlighted entry"),
+            Line::from("Space: open directory or select URL/magnet / torrent file"),
+            Line::from("F5 or Ctrl+S: start download"),
             Line::from("Paste: insert file path, URL, or magnet link"),
-            Line::from("Enter: queue the torrent"),
             Line::from(""),
             Line::styled(
                 "Downloads",
@@ -1741,7 +1803,7 @@ impl App {
             Line::from("Up/Down or j/k: select a torrent"),
             Line::from("Left/Right or h/l: choose Stop / Resume / Cancel"),
             Line::from("Home/End or g/G: jump to first or last torrent"),
-            Line::from("Enter: run the selected action"),
+            Line::from("Space: run the selected action"),
             Line::from("/: open search/filter dialog"),
             Line::from("s: open sort dialog"),
             Line::from("r: reverse current sort order"),
@@ -2031,13 +2093,6 @@ impl FormField {
         }
     }
 
-    fn short_title(self) -> &'static str {
-        match self {
-            Self::TorrentSource => "Source",
-            Self::DownloadDir => "Directory",
-        }
-    }
-
     fn placeholder(self) -> &'static str {
         match self {
             Self::TorrentSource => {
@@ -2049,8 +2104,8 @@ impl FormField {
 
     fn browser_subject(self) -> &'static str {
         match self {
-            Self::TorrentSource => "source path",
-            Self::DownloadDir => "directory path",
+            Self::TorrentSource => "source entries",
+            Self::DownloadDir => "directories",
         }
     }
 
