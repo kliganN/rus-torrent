@@ -184,6 +184,19 @@ enum DownloadDisplayMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DownloadHealth {
+    Error,
+    Complete,
+    Paused,
+    Metadata,
+    Healthy,
+    Active,
+    Thin,
+    Searching,
+    Stalled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConfirmAction {
     ExitApp,
     ClearFilter,
@@ -1575,35 +1588,51 @@ impl App {
         let items = self
             .downloads
             .iter()
-            .map(|download| match self.downloads_view.display_mode {
-                DownloadDisplayMode::Compact => ListItem::new(Line::from(vec![
-                    Span::styled(
-                        download.name.as_str(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!(
-                        "  #{:02}  {:.1}%  {}  ↓ {}  peers {}",
-                        download.id,
-                        download.progress_ratio * 100.0,
-                        download.state,
-                        download.download_speed.as_deref().unwrap_or("n/a"),
-                        download.live_peers
-                    )),
-                ])),
-                DownloadDisplayMode::Expanded => ListItem::new(vec![
-                    Line::from(download.name.as_str()),
-                    Line::from(format!(
-                        "#{}  {}  {:.1}%",
-                        download.id,
-                        download.state,
-                        download.progress_ratio * 100.0
-                    )),
-                    Line::from(format!(
-                        "↓ {}  peers {}",
-                        download.download_speed.as_deref().unwrap_or("n/a"),
-                        download.live_peers
-                    )),
-                ]),
+            .map(|download| {
+                let health = download.health();
+                let eta = download.eta_label();
+
+                match self.downloads_view.display_mode {
+                    DownloadDisplayMode::Compact => ListItem::new(Line::from(vec![
+                        Span::styled(
+                            download.name.as_str(),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(format!(
+                            "  #{:02}  {:.1}%  {}  ↓ {}  eta ",
+                            download.id,
+                            download.progress_ratio * 100.0,
+                            download.state,
+                            download.download_speed.as_deref().unwrap_or("n/a"),
+                        )),
+                        Span::styled(eta, Style::default().fg(Color::Cyan)),
+                        Span::raw("  "),
+                        Span::styled(health.label(), health.style().add_modifier(Modifier::BOLD)),
+                    ])),
+                    DownloadDisplayMode::Expanded => ListItem::new(vec![
+                        Line::from(download.name.as_str()),
+                        Line::from(vec![
+                            Span::raw(format!(
+                                "#{}  {}  {:.1}%  ",
+                                download.id,
+                                download.state,
+                                download.progress_ratio * 100.0
+                            )),
+                            Span::styled(
+                                health.label(),
+                                health.style().add_modifier(Modifier::BOLD),
+                            ),
+                        ]),
+                        Line::from(vec![
+                            Span::raw(format!(
+                                "↓ {}  eta ",
+                                download.download_speed.as_deref().unwrap_or("n/a"),
+                            )),
+                            Span::styled(eta, Style::default().fg(Color::Cyan)),
+                            Span::raw(format!("  peers {}", download.live_peers)),
+                        ]),
+                    ]),
+                }
             })
             .collect::<Vec<_>>();
 
@@ -1641,7 +1670,7 @@ impl App {
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Length(3),
-                    Constraint::Length(13),
+                    Constraint::Length(17),
                     Constraint::Min(0),
                 ])
                 .split(body[1]);
@@ -1665,13 +1694,20 @@ impl App {
             frame.render_widget(gauge, right[0]);
 
             self.render_download_actions(frame, right[1], download);
+            let health = download.health();
+            let eta = download.eta_label();
 
             let stats = Paragraph::new(Text::from(vec![
                 Line::from(format!("State: {}", download.state)),
+                Line::from(vec![
+                    Span::raw("Health: "),
+                    Span::styled(health.label(), health.style().add_modifier(Modifier::BOLD)),
+                ]),
                 Line::from(format!(
                     "Finished: {}",
                     if download.finished { "yes" } else { "no" }
                 )),
+                Line::from(format!("ETA: {eta}")),
                 Line::from(format!(
                     "Downloaded: {}",
                     format_bytes(download.progress_bytes)
@@ -1690,8 +1726,9 @@ impl App {
                 )),
                 Line::from(format!("Peers: {}", download.live_peers)),
                 Line::from(format!("Connecting: {}", download.connecting_peers)),
+                Line::from(format!("Queued peers: {}", download.queued_peers)),
                 Line::from(format!("Seen peers: {}", download.seen_peers)),
-                Line::from("Seeds: unavailable in current librqbit torrent stats"),
+                Line::from(format!("Dead peers: {}", download.dead_peers)),
                 Line::from(format!(
                     "Size: {}",
                     if download.total_bytes == 0 {
@@ -2460,6 +2497,73 @@ impl ConfirmChoice {
 impl TorrentSnapshot {
     fn is_stopped(&self) -> bool {
         self.state.to_ascii_lowercase().contains("paused")
+    }
+
+    fn eta_label(&self) -> String {
+        if let Some(eta) = &self.eta {
+            eta.clone()
+        } else if self.finished {
+            "complete".to_string()
+        } else if self.is_stopped() {
+            "paused".to_string()
+        } else if self.total_bytes == 0 {
+            "waiting for metadata".to_string()
+        } else if self.download_speed_mib > 0.0 {
+            "calculating".to_string()
+        } else {
+            "n/a".to_string()
+        }
+    }
+
+    fn health(&self) -> DownloadHealth {
+        if self.error.is_some() {
+            DownloadHealth::Error
+        } else if self.finished {
+            DownloadHealth::Complete
+        } else if self.is_stopped() {
+            DownloadHealth::Paused
+        } else if self.total_bytes == 0 {
+            DownloadHealth::Metadata
+        } else if self.live_peers >= 5 {
+            DownloadHealth::Healthy
+        } else if self.live_peers >= 2 || (self.live_peers >= 1 && self.connecting_peers >= 1) {
+            DownloadHealth::Active
+        } else if self.live_peers == 1 || self.connecting_peers + self.queued_peers >= 2 {
+            DownloadHealth::Thin
+        } else if self.seen_peers == 0 && self.dead_peers == 0 {
+            DownloadHealth::Searching
+        } else {
+            DownloadHealth::Stalled
+        }
+    }
+}
+
+impl DownloadHealth {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Complete => "complete",
+            Self::Paused => "paused",
+            Self::Metadata => "metadata",
+            Self::Healthy => "healthy",
+            Self::Active => "active",
+            Self::Thin => "thin",
+            Self::Searching => "searching",
+            Self::Stalled => "stalled",
+        }
+    }
+
+    fn style(self) -> Style {
+        match self {
+            Self::Error | Self::Stalled => Style::default().fg(Color::Red),
+            Self::Complete => Style::default().fg(Color::Green),
+            Self::Paused => Style::default().fg(Color::Yellow),
+            Self::Metadata => Style::default().fg(Color::Magenta),
+            Self::Healthy => Style::default().fg(Color::Green),
+            Self::Active => Style::default().fg(Color::Cyan),
+            Self::Thin => Style::default().fg(Color::Yellow),
+            Self::Searching => Style::default().fg(Color::DarkGray),
+        }
     }
 }
 

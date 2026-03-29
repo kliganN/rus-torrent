@@ -35,10 +35,13 @@ pub struct TorrentSnapshot {
     pub error: Option<String>,
     pub download_speed: Option<String>,
     pub upload_speed: Option<String>,
+    pub eta: Option<String>,
     pub download_speed_mib: f64,
+    pub queued_peers: usize,
     pub live_peers: usize,
     pub connecting_peers: usize,
     pub seen_peers: usize,
+    pub dead_peers: usize,
     pub source: String,
     pub output_dir: PathBuf,
 }
@@ -201,20 +204,26 @@ impl TorrentEngine {
                 let (
                     download_speed,
                     upload_speed,
+                    eta,
                     download_speed_mib,
+                    queued_peers,
                     live_peers,
                     connecting_peers,
                     seen_peers,
+                    dead_peers,
                 ) = match stats.live.as_ref() {
                     Some(live) => (
                         Some(live.download_speed.to_string()),
                         Some(live.upload_speed.to_string()),
+                        live.time_remaining.as_ref().map(ToString::to_string),
                         live.download_speed.mbps,
+                        live.snapshot.peer_stats.queued,
                         live.snapshot.peer_stats.live,
                         live.snapshot.peer_stats.connecting,
                         live.snapshot.peer_stats.seen,
+                        live.snapshot.peer_stats.dead,
                     ),
-                    None => (None, None, 0.0, 0, 0, 0),
+                    None => (None, None, None, 0.0, 0, 0, 0, 0, 0),
                 };
                 let registration = registrations.get(&id).cloned().unwrap_or_else(|| {
                     let fallback_name = handle
@@ -248,10 +257,13 @@ impl TorrentEngine {
                     error: stats.error.clone(),
                     download_speed,
                     upload_speed,
+                    eta,
                     download_speed_mib,
+                    queued_peers,
                     live_peers,
                     connecting_peers,
                     seen_peers,
+                    dead_peers,
                     source: registration.source,
                     output_dir: registration.output_dir,
                 });
